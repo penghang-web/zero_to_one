@@ -19,8 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "gpio.h"
-#include "stdio.h"
-#include "stm32f103xb.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -100,8 +98,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // PC13 翻转（低=亮）
-    printf("hello\r\n");                                  // 每秒一帧，验证 TX 稳定
-    HAL_Delay(500);   
+    HAL_Delay(500);// 每秒一帧，验证 TX 稳定
   }
   /* USER CODE END 3 */
 }
