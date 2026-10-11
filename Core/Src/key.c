@@ -1,11 +1,15 @@
 /**
   ******************************************************************************
   * @file    key.c
-  * @brief   按键状态机 + LED/蜂鸣器报警行为（模块私有，不污染全局命名空间）
+  * @brief   按键状态机 + LED/报警状态（模块私有，不污染全局命名空间）
+  *          阶段3：LED 闪烁由 TIM2 1ms 节拍驱动（非阻塞）；蜂鸣器已独立到 buzzer.c
   ******************************************************************************
   */
 #include "key.h"
-#include "main.h"   /* LED_PC13 / KEY_EXTI / BUZZER 引脚宏，由 CubeMX 生成 */
+#include "main.h"   /* LED_PC13 / KEY_EXTI 引脚宏，由 CubeMX 生成 */
+#include "buzzer.h" /* Buzzer_On / Buzzer_Off / Buzzer_Process：报警态驱动蜂鸣器 */
+
+extern volatile uint32_t g_systick_ms;   /* TIM2 1ms 节拍，main.c 维护 */
 
 /* ------------------------------------------------------------------ */
 /* 模块私有状态（static 封装）                                          */
@@ -47,17 +51,6 @@ void Key_EXTI_Callback(uint16_t GPIO_Pin)
   }
 }
 
-/* 有源蜂鸣器：低电平响、高电平停（与 .ioc 初始高电平 GPIO_PIN_SET 一致） */
-static void Buzzer_On(void)
-{
-  HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
-}
-
-static void Buzzer_Off(void)
-{
-  HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_SET);
-}
-
 /* 由 Shell 命令(led on/off)调用：直接设定报警态，复用现有 LED 常亮/闪烁与蜂鸣器逻辑 */
 void Key_SetAlarm(uint8_t on)
 {
@@ -74,9 +67,10 @@ void Key_SetAlarm(uint8_t on)
   }
 }
 
-/* 主循环调用：非阻塞按键状态机 + LED/蜂鸣器行为
+/* 主循环调用：非阻塞按键状态机 + LED 行为
  * 设计要点：按下瞬间（下降沿）立即翻转报警状态，不依赖"消抖后读引脚低才翻转"，
- *          因此短按、长按都能可靠触发；松开与消抖用轮询 + HAL_GetTick() 非阻塞完成。 */
+ *          因此短按、长按都能可靠触发；松开与消抖用轮询 + g_systick_ms 非阻塞完成。
+ *          LED 闪烁由 TIM2 1ms 节拍驱动，不再使用 HAL_Delay；蜂鸣器行为交 buzzer.c。 */
 void Key_Process(void)
 {
   switch (s_key_state)
@@ -102,13 +96,13 @@ void Key_Process(void)
     case KEY_WAIT_RELEASE:
       if (HAL_GPIO_ReadPin(KEY_EXTI_GPIO_Port, KEY_EXTI_Pin) == GPIO_PIN_SET)
       {                                    /* 轮询发现已松开（非阻塞） */
-        s_key_tick = HAL_GetTick();
+        s_key_tick = g_systick_ms;
         s_key_state = KEY_DEBOUNCE_UP;
       }
       break;
 
     case KEY_DEBOUNCE_UP:
-      if (HAL_GetTick() - s_key_tick >= 15)/* 松开消抖 15ms */
+      if (g_systick_ms - s_key_tick >= 15) /* 松开消抖 15ms */
       {
         s_key_irq = 0;                     /* 清掉抖动期间可能残留的边沿标志 */
         s_key_state = KEY_IDLE;            /* 解锁，准备下一次按下 */
@@ -116,14 +110,19 @@ void Key_Process(void)
       break;
   }
 
-  /* ---- LED 闪烁 / 报警态常亮 ---- */
+  /* ---- LED 闪烁 / 报警态常亮（由 TIM2 1ms 节拍驱动，非阻塞，替代 HAL_Delay）---- */
+  Buzzer_Process();   /* 一次性 beep 到期自动关断（蜂鸣器模块自管理） */
   if (s_alarm_state)
   {
-    HAL_Delay(100);                        /* 报警态：LED 保持常亮，轮询等待下次按键 */
+    HAL_GPIO_WritePin(LED_PC13_GPIO_Port, LED_PC13_Pin, GPIO_PIN_RESET); /* 报警：LED 常亮 */
   }
   else
   {
-    HAL_GPIO_TogglePin(LED_PC13_GPIO_Port, LED_PC13_Pin); /* 正常态：1 Hz 闪烁 = 系统存活 */
-    HAL_Delay(500);
+    static uint32_t s_led_toggle_ms = 0;
+    if (g_systick_ms - s_led_toggle_ms >= 500)   /* 正常态：1 Hz 闪烁 = 系统存活 */
+    {
+      HAL_GPIO_TogglePin(LED_PC13_GPIO_Port, LED_PC13_Pin);
+      s_led_toggle_ms = g_systick_ms;
+    }
   }
 }

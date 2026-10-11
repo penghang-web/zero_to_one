@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -47,12 +48,14 @@
 
 /* USER CODE BEGIN PV */
 /* 按键相关状态已封装到 key.c（key.h 提供 Key_Init / Key_Process / Key_EXTI_Callback 接口） */
+volatile uint32_t g_systick_ms = 0;   /* TIM2 1ms 节拍计数器，由 HAL_TIM_PeriodElapsedCallback 累加 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-/* Buzzer_On / Buzzer_Off 已随报警逻辑移入 key.c，作为模块私有函数 */
+/* 蜂鸣器驱动已独立成 buzzzer.c（Buzzer_On/Buzzer_Off/Buzzer_Beep/Buzzer_Process，
+ * TIM3_CH4 PWM），由 key.c 与 console.c 通过 buzzer.h 调用 */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -91,11 +94,17 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
   Console_RxStart();                   /* 启动 USART1 RX（IDLE+DMA 收帧） */
   Console_Printf("\r\n==== MiniBlackBox USART1 Shell ====\r\n");
   Console_Printf("baud 115200 8N1, RX=IDLE+DMA. type 'help'.\r\n");
+
+  /* 阶段3：启动系统节拍与蜂鸣器 PWM（PB1=TIM3_CH4） */
+  HAL_TIM_Base_Start_IT(&htim2);                    /* TIM2 1ms 节拍中断 -> 累加 g_systick_ms */
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);         /* 蜂鸣器 PWM 运行，占空比初始 0 = 静音 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -157,6 +166,15 @@ void SystemClock_Config(void)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   Key_EXTI_Callback(GPIO_Pin);   /* 路由到 key.c 的按键模块 */
+}
+
+/* TIM2 1ms 节拍中断回调：仅累加系统节拍，长逻辑留主循环（契合"中断收数、主循环处理"原则） */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2)
+  {
+    g_systick_ms++;
+  }
 }
 /* USER CODE END 4 */
 

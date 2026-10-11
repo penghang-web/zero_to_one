@@ -12,10 +12,13 @@
 #include "console.h"
 #include "usart.h"   /* huart1 (extern) */
 #include "key.h"     /* Key_SetAlarm / Key_GetAlarmState */
+#include "buzzer.h"  /* Buzzer_Beep：一次性蜂鸣（非阻塞） */
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+
+extern volatile uint32_t g_systick_ms;   /* TIM2 1ms 节拍，main.c 维护 */
 
 #define RX_BUF_SIZE  64
 #define TX_BUF_SIZE  128
@@ -94,7 +97,7 @@ static void Shell_Exec(char *line)
 
   if (strcmp(line, "help") == 0)
   {
-    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n");
+    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n");
   }
   else if (strcmp(line, "info") == 0)
   {
@@ -112,6 +115,15 @@ static void Shell_Exec(char *line)
     Key_SetAlarm(0);
     Console_Printf("led off\r\n");
   }
+  else if (strncmp(line, "beep", 4) == 0 && (line[4] == ' ' || line[4] == '\0'))
+  {
+    unsigned long ms = 200;
+    unsigned duty = 50;
+    sscanf(line, "beep %lu %u", &ms, &duty);
+    if (duty > 100) duty = 100;
+    Buzzer_Beep((uint16_t)ms, (uint8_t)duty);   /* 一次性蜂鸣（非阻塞，ms 后自动停） */
+    Console_Printf("beep %lu ms @ %u%%\r\n", ms, duty);
+  }
   else
   {
     Console_Printf("unknown: %s (try 'help')\r\n", line);
@@ -121,8 +133,8 @@ static void Shell_Exec(char *line)
 /* 主循环调用：心跳日志 + 处理已收帧并重新启动 RX */
 void Console_Process(void)
 {
-  /* 5s 心跳：证明系统存活、日志通道通畅 */
-  uint32_t now = HAL_GetTick();
+  /* 5s 心跳：证明系统存活、日志通道通畅（由 TIM2 1ms 节拍驱动，非阻塞） */
+  uint32_t now = g_systick_ms;
   if (now - s_heartbeat_ms >= HEARTBEAT_MS)
   {
     s_heartbeat_ms = now;
