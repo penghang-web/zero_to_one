@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -45,8 +47,6 @@
 /* USER CODE BEGIN PV */
 /* 按键相关状态已封装到 key.c（key.h 提供 Key_Init / Key_Process / Key_EXTI_Callback 接口） */
 /* USER CODE END PV */
-
-
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -88,6 +88,8 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
   /* USER CODE END 2 */
@@ -103,8 +105,6 @@ int main(void)
     Key_Process();
   }                                        /* while(1) 闭合 */
   /* USER CODE END 3 */
-
-
 }
 
 /**
