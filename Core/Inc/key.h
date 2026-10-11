@@ -19,5 +19,6 @@ void     Key_Init(void);
 void     Key_Process(void);
 void     Key_EXTI_Callback(uint16_t GPIO_Pin);
 uint8_t  Key_GetAlarmState(void);
+void     Key_SetAlarm(uint8_t on);     /* 供 Shell 的 led on/off 命令复用 LED/蜂鸣器逻辑 */
 
 #endif /* KEY_H */

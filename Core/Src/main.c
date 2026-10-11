@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "key.h"
+#include "console.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -92,6 +93,9 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
+  Console_RxStart();                   /* 启动 USART1 RX（IDLE+DMA 收帧） */
+  Console_Printf("\r\n==== MiniBlackBox USART1 Shell ====\r\n");
+  Console_Printf("baud 115200 8N1, RX=IDLE+DMA. type 'help'.\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -103,6 +107,8 @@ int main(void)
     /* USER CODE BEGIN 3 */
     /* ---- 按键逻辑已封装到 key.c：主循环只负责"喂"状态机 ---- */
     Key_Process();
+    /* ---- USART 控制台：处理串口帧 + 心跳日志（每圈调用） ---- */
+    Console_Process();
   }                                        /* while(1) 闭合 */
   /* USER CODE END 3 */
 }

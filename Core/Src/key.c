@@ -58,6 +58,22 @@ static void Buzzer_Off(void)
   HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_SET);
 }
 
+/* 由 Shell 命令(led on/off)调用：直接设定报警态，复用现有 LED 常亮/闪烁与蜂鸣器逻辑 */
+void Key_SetAlarm(uint8_t on)
+{
+  if (on && !s_alarm_state)
+  {
+    s_alarm_state = 1;
+    Buzzer_On();
+    HAL_GPIO_WritePin(LED_PC13_GPIO_Port, LED_PC13_Pin, GPIO_PIN_RESET); /* LED 常亮 */
+  }
+  else if (!on && s_alarm_state)
+  {
+    s_alarm_state = 0;
+    Buzzer_Off();
+  }
+}
+
 /* 主循环调用：非阻塞按键状态机 + LED/蜂鸣器行为
  * 设计要点：按下瞬间（下降沿）立即翻转报警状态，不依赖"消抖后读引脚低才翻转"，
  *          因此短按、长按都能可靠触发；松开与消抖用轮询 + HAL_GetTick() 非阻塞完成。 */
