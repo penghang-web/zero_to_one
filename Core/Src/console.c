@@ -16,12 +16,15 @@
 #include "watchdog.h" /* WDG_Feed / WDG_TestHang：看门狗状态查询与复位验证 */
 #include "w25qxx.h"   /* W25QXX_JEDEC / FontReady / WriteData：flashcn 烧录 + w25 命令 */
 #include "ui.h"       /* UI_Demo：oled 命令触发 OLED 演示屏 */
+#include "mpu6050.h"  /* 阶段6：MPU6050 原始数据打印 */
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 
 extern volatile uint32_t g_systick_ms;   /* TIM2 1ms 节拍，main.c 维护 */
+extern MPU6050_RawData g_mpu;            /* 阶段6：最新采样，main.c 维护 */
+extern uint8_t g_mpu_ok;                 /* 阶段6：MPU 是否已唤醒并识别成功 */
 
 #define RX_BUF_SIZE  64
 #define TX_BUF_SIZE  128
@@ -37,6 +40,9 @@ static uint32_t s_heartbeat_ms = 0;
 static uint8_t  s_flash_mode   = 0;   /* 1 = 正在接收二进制流写 W25Q */
 static uint32_t s_flash_total  = 0;   /* 期望接收总字节 */
 static uint32_t s_flash_offset = 0;   /* 已写入字节 */
+
+/* mpu 持续打印流：'mpu on' 开启后每 500ms 打印一行原始三轴数据 */
+static uint8_t  s_mpu_stream   = 0;
 
 /* 阻塞发送：方案A 简单直接，发长串时会短暂占用主循环（115200 下几毫秒） */
 void Console_Tx(const uint8_t *buf, uint16_t len)
@@ -105,7 +111,7 @@ static void Shell_Exec(char *line)
 
   if (strcmp(line, "help") == 0)
   {
-    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n wdg [status|stop]\r\n w25\r\n oled\r\n flashcn <size>\r\n");
+    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n wdg [status|stop]\r\n w25\r\n oled\r\n flashcn <size>\r\n mpu [on|off]\r\n");
   }
   else if (strcmp(line, "info") == 0)
   {
@@ -166,6 +172,39 @@ static void Shell_Exec(char *line)
     UI_Demo();
     Console_Printf("oled demo refreshed (font=%s)\r\n", W25QXX_FontReady() ? "READY" : "none");
   }
+  else if (strncmp(line, "mpu", 3) == 0 && (line[3] == ' ' || line[3] == '\0'))
+  {
+    /* mpu         —— 打印一次当前原始三轴数据
+     * mpu on      —— 持续打印流（每 500ms 一行），便于观察晃动时数据跟随变化
+     * mpu off     —— 关闭持续打印流 */
+    if (strcmp(line, "mpu") == 0)
+    {
+      if (g_mpu_ok)
+      {
+        Console_Printf("MPU raw: ax=%d ay=%d az=%d gx=%d gy=%d gz=%d t=%d\r\n",
+                       g_mpu.ax, g_mpu.ay, g_mpu.az,
+                       g_mpu.gx, g_mpu.gy, g_mpu.gz, g_mpu.temp);
+      }
+      else
+      {
+        Console_Printf("MPU not ready (device absent or not woken). retrying...\r\n");
+      }
+    }
+    else if (strcmp(line, "mpu on") == 0)
+    {
+      s_mpu_stream = 1;
+      Console_Printf("MPU stream ON (500ms/tick). 'mpu off' to stop.\r\n");
+    }
+    else if (strcmp(line, "mpu off") == 0)
+    {
+      s_mpu_stream = 0;
+      Console_Printf("MPU stream OFF.\r\n");
+    }
+    else
+    {
+      Console_Printf("usage: mpu | mpu on | mpu off\r\n");
+    }
+  }
   else if (strncmp(line, "flashcn", 6) == 0 && (line[6] == ' ' || line[6] == '\0'))
   {
     /* 烧录字库：PC 侧把 [魔数4字节 + hzk16.bin] 流发进来。默认大小 261700 = 4 + 261696 */
@@ -198,6 +237,16 @@ void Console_Process(void)
     Console_Printf("[hb] uptime=%lu s, font=%s\r\n",
                    (unsigned long)(now / 1000u),
                    W25QXX_FontReady() ? "OK" : "none");
+  }
+
+  /* mpu 持续打印流：'mpu on' 开启后每 500ms 打印一次原始三轴数据。
+     主循环已持续把采样写进 g_mpu，这里只负责按节拍输出（烧录模式不打，避免污染二进制流）。 */
+  static uint32_t s_mpu_print_ms = 0;
+  if (s_mpu_stream && !s_flash_mode && g_mpu_ok && now - s_mpu_print_ms >= 500U)
+  {
+    s_mpu_print_ms = now;
+    Console_Printf("MPU ax=%d ay=%d az=%d gx=%d gy=%d gz=%d\r\n",
+                   g_mpu.ax, g_mpu.ay, g_mpu.az, g_mpu.gx, g_mpu.gy, g_mpu.gz);
   }
 
   if (!s_rx_ready)

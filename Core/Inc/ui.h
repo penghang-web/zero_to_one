@@ -14,11 +14,13 @@
 
 /* 对外接口（实现见 ui.c）
  * - UI_Init  : 初始化 OLED（内部调 SSD1306_Init）
- * - UI_Demo  : 绘制一屏演示内容（中英文混排）并立即刷屏，用于验证字库链路
- * - UI_Refresh: 仅重刷当前显存（内容由 UI_Demo 等写入）
+ * - UI_Demo  : 绘制状态屏（中英文混排）并立即刷屏，用于验证字库链路
+ * - UI_MPU   : 绘制 MPU 三轴原始数据屏（ACC/EGYRO 两页每 2s 自动切换），并刷屏
+ * - UI_Refresh: 仅重刷当前显存（内容由 UI_Demo/UI_MPU 等写入）
  */
 void UI_Init(void);
 void UI_Demo(void);
+void UI_MPU(void);
 void UI_Refresh(void);
 
 #endif /* UI_H */

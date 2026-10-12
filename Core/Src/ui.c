@@ -20,10 +20,13 @@
 #include "ui.h"
 #include "ssd1306.h"
 #include "w25qxx.h"     /* W25QXX_FontReady：字库是否已烧录 */
+#include "mpu6050.h"    /* 阶段6：MPU6050_RawData 类型 + WHO_AM_I 常量 */
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
 
 extern volatile uint32_t g_systick_ms;   /* main.c 定义的 1ms 节拍计数 */
+extern MPU6050_RawData g_mpu;            /* main.c 持续采样的最新原始数据 */
+extern uint8_t g_mpu_ok;                 /* main.c：MPU 是否已唤醒并识别成功 */
 
 /* ---- OLED 文本布局规格（字符高度固定 16px）---- */
 #define OLED_LINE_GAP  3       /* 行间距 */
@@ -64,5 +67,49 @@ void UI_Demo(void)
 
 void UI_Refresh(void)
 {
+  SSD1306_Refresh();
+}
+
+/* -------------------------------------------------------------------------- */
+/* MPU 三轴原始数据屏                                                          */
+/* 约束：同样遵循"字符高度固定 16px、3 行、行间距 3px、底部 10px 留白"规格。   */
+/* 128px 宽度约 11 字符/行，6 个轴(各 9 字符)放不下，故分两页每 2s 自动切换： */
+/*   页0(ACC)  : AX= / AY= / AZ=                                            */
+/*   页1(GYRO) : GX= / GY= / GZ=                                            */
+/* 标签首字母 A/G 即区分加速度/陀螺仪。未连接时显示 "MPU N/A"。               */
+void UI_MPU(void)
+{
+  SSD1306_Clear();
+
+  if (!g_mpu_ok)
+  {
+    SSD1306_DrawString(0, UI_LINE0_Y, "MPU N/A", 1);
+    SSD1306_Refresh();
+    return;
+  }
+
+  /* 每 2s 在 加速度(ACC) / 陀螺仪(GYRO) 两页间切换 */
+  uint8_t accel = ((g_systick_ms / 2000U) % 2U) == 0U;
+  char line[16];
+
+  if (accel)
+  {
+    snprintf(line, sizeof(line), "AX=%+6d", g_mpu.ax);
+    SSD1306_DrawString(0, UI_LINE0_Y, line, 1);
+    snprintf(line, sizeof(line), "AY=%+6d", g_mpu.ay);
+    SSD1306_DrawString(0, UI_LINE1_Y, line, 1);
+    snprintf(line, sizeof(line), "AZ=%+6d", g_mpu.az);
+    SSD1306_DrawString(0, UI_LINE2_Y, line, 1);
+  }
+  else
+  {
+    snprintf(line, sizeof(line), "GX=%+6d", g_mpu.gx);
+    SSD1306_DrawString(0, UI_LINE0_Y, line, 1);
+    snprintf(line, sizeof(line), "GY=%+6d", g_mpu.gy);
+    SSD1306_DrawString(0, UI_LINE1_Y, line, 1);
+    snprintf(line, sizeof(line), "GZ=%+6d", g_mpu.gz);
+    SSD1306_DrawString(0, UI_LINE2_Y, line, 1);
+  }
+
   SSD1306_Refresh();
 }

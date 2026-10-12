@@ -33,6 +33,7 @@
 #include "watchdog.h"   /* 阶段4：WDG_Feed 由 TIM2 节拍 ISR 调用 */
 #include "w25qxx.h"    /* 阶段5：W25Q/GD25 SPI Flash（字库存储），W25QXX_Init/JEDEC */
 #include "ui.h"        /* 阶段5：OLED UI 层（SSD1306 演示屏） */
+#include "mpu6050.h"   /* 阶段6：MPU6050 I2C 驱动（Init/SelfTest/ReadAll） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -55,6 +56,12 @@
 /* USER CODE BEGIN PV */
 /* 按键相关状态已封装到 key.c（key.h 提供 Key_Init / Key_Process / Key_EXTI_Callback 接口） */
 volatile uint32_t g_systick_ms = 0;   /* TIM2 1ms 节拍计数器，由 HAL_TIM_PeriodElapsedCallback 累加 */
+
+/* 阶段6：MPU6050 原始数据（主循环持续采样，控制台 mpu 命令打印）
+ * g_mpu        —— 最新一次原始采样（供 mpu 命令打印，后续也可供 UI 显示）
+ * g_mpu_ok     —— 1=已唤醒且 WHO_AM_I 匹配，主循环才会周期读；否则转入重试 */
+MPU6050_RawData g_mpu;
+uint8_t g_mpu_ok = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -122,6 +129,24 @@ int main(void)
     Console_Printf("type 'oled' to draw demo, 'flashcn <size>' to burn font.\r\n");
   }
 
+  /* 阶段6：MPU6050 初始化（先唤醒 PWR_MGMT_1，再配置量程/DLPF）。
+   * 失败不阻塞主流程——置 g_mpu_ok=0，由主循环每 5s 重试（支持未接/热插拔自愈）。 */
+  {
+    uint8_t who = 0;
+    if (MPU6050_Init() == HAL_OK &&
+        MPU6050_SelfTestRegister(&who) == HAL_OK &&
+        who == MPU6050_WHO_AM_I_VAL)
+    {
+      g_mpu_ok = 1;
+      Console_Printf("MPU6050 ok who=0x%02X (exp 0x%02X)\r\n", who, MPU6050_WHO_AM_I_VAL);
+    }
+    else
+    {
+      g_mpu_ok = 0;
+      Console_Printf("MPU6050 not found (who=0x%02X), will retry every 5s\r\n", who);
+    }
+  }
+
   /* 阶段3：启动系统节拍与蜂鸣器 PWM（PB1=TIM3_CH4） */
   HAL_TIM_Base_Start_IT(&htim2);                    /* TIM2 1ms 节拍中断 -> 累加 g_systick_ms */
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);         /* 蜂鸣器 PWM 运行，占空比初始 0 = 静音 */
@@ -143,13 +168,56 @@ int main(void)
     /* ---- USART 控制台：处理串口帧 + 心跳日志（每圈调用） ---- */
     Console_Process();
 
-    /* ---- 阶段5：OLED 演示屏每 1s 重绘一次（验证字库链路；字库未烧录时画占位框） ---- */
+    /* ---- OLED 显示：状态屏(UI_Demo) 与 MPU 三轴屏(UI_MPU) 每 4s 交替 ---- */
     {
-      static uint32_t s_oled_ms = 0;
-      if (g_systick_ms - s_oled_ms >= 1000U)
+      static uint32_t s_oled_ms = 0;    /* 屏幕切换节拍 */
+      static uint32_t s_oled_draw = 0;  /* 当前屏重绘节拍 */
+      static uint8_t  s_oled_mode = 0;  /* 0=状态屏, 1=MPU屏 */
+      if (g_systick_ms - s_oled_ms >= 4000U)
       {
         s_oled_ms = g_systick_ms;
-        UI_Demo();
+        s_oled_mode ^= 1U;
+      }
+      /* MPU 屏数据变化快，每 500ms 重绘；状态屏每 1s 重绘即可 */
+      uint32_t period = (s_oled_mode == 1U) ? 500U : 1000U;
+      if (g_systick_ms - s_oled_draw >= period)
+      {
+        s_oled_draw = g_systick_ms;
+        if (s_oled_mode == 1U)
+          UI_MPU();
+        else
+          UI_Demo();
+      }
+    }
+
+    /* ---- 阶段6：MPU6050 持续采样（与 OLED 共用 I2C1 总线） ----
+     * g_mpu_ok 时每 100ms 突发读 14 字节更新 g_mpu；读取失败则标记失连转重试。
+     * 未连接时每 5s 重试一次初始化（HAL_I2C 超时 100ms，避免每圈阻塞主循环）。 */
+    {
+      static uint32_t s_mpu_ms = 0;
+      static uint32_t s_mpu_retry_ms = 0;
+      if (g_mpu_ok)
+      {
+        if (g_systick_ms - s_mpu_ms >= 100U)
+        {
+          s_mpu_ms = g_systick_ms;
+          if (MPU6050_ReadAll(&g_mpu) != HAL_OK)
+          {
+            g_mpu_ok = 0;   /* 读取失败：标记失连，下一轮转入重试 */
+          }
+        }
+      }
+      else if (g_systick_ms - s_mpu_retry_ms >= 5000U)
+      {
+        s_mpu_retry_ms = g_systick_ms;
+        uint8_t who = 0;
+        if (MPU6050_Init() == HAL_OK &&
+            MPU6050_SelfTestRegister(&who) == HAL_OK &&
+            who == MPU6050_WHO_AM_I_VAL)
+        {
+          g_mpu_ok = 1;
+          Console_Printf("MPU6050 reconnected who=0x%02X\r\n", who);
+        }
       }
     }
   }                                        /* while(1) 闭合 */
