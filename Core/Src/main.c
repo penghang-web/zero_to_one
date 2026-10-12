@@ -21,6 +21,7 @@
 #include "dma.h"
 #include "i2c.h"
 #include "iwdg.h"
+#include "spi.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -30,6 +31,8 @@
 #include "key.h"
 #include "console.h"
 #include "watchdog.h"   /* 阶段4：WDG_Feed 由 TIM2 节拍 ISR 调用 */
+#include "w25qxx.h"    /* 阶段5：W25Q/GD25 SPI Flash（字库存储），W25QXX_Init/JEDEC */
+#include "ui.h"        /* 阶段5：OLED UI 层（SSD1306 演示屏） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -101,11 +104,23 @@ int main(void)
   MX_TIM3_Init();
   MX_IWDG_Init();
   MX_I2C1_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
   Console_RxStart();                   /* 启动 USART1 RX（IDLE+DMA 收帧） */
+  W25QXX_Init();                       /* 阶段5：读 W25Q/GD25 JEDEC 并缓存容量 */
+  UI_Init();                           /* 阶段5：初始化 SSD1306 OLED */
   Console_Printf("\r\n==== MiniBlackBox USART1 Shell ====\r\n");
   Console_Printf("baud 115200 8N1, RX=IDLE+DMA. type 'help'.\r\n");
+  {
+    uint8_t jid[3];
+    W25QXX_JEDEC(jid);
+    Console_Printf("W25Q JEDEC %02X%02X%02X cap=%lu B font=%s\r\n",
+                   jid[0], jid[1], jid[2],
+                   (unsigned long)W25QXX_CapacityBytes(),
+                   W25QXX_FontReady() ? "READY" : "none");
+    Console_Printf("type 'oled' to draw demo, 'flashcn <size>' to burn font.\r\n");
+  }
 
   /* 阶段3：启动系统节拍与蜂鸣器 PWM（PB1=TIM3_CH4） */
   HAL_TIM_Base_Start_IT(&htim2);                    /* TIM2 1ms 节拍中断 -> 累加 g_systick_ms */
@@ -127,6 +142,16 @@ int main(void)
     Key_Process();
     /* ---- USART 控制台：处理串口帧 + 心跳日志（每圈调用） ---- */
     Console_Process();
+
+    /* ---- 阶段5：OLED 演示屏每 1s 重绘一次（验证字库链路；字库未烧录时画占位框） ---- */
+    {
+      static uint32_t s_oled_ms = 0;
+      if (g_systick_ms - s_oled_ms >= 1000U)
+      {
+        s_oled_ms = g_systick_ms;
+        UI_Demo();
+      }
+    }
   }                                        /* while(1) 闭合 */
   /* USER CODE END 3 */
 }

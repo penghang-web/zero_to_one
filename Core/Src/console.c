@@ -14,6 +14,8 @@
 #include "key.h"     /* Key_SetAlarm / Key_GetAlarmState */
 #include "buzzer.h"  /* Buzzer_Beep：一次性蜂鸣（非阻塞） */
 #include "watchdog.h" /* WDG_Feed / WDG_TestHang：看门狗状态查询与复位验证 */
+#include "w25qxx.h"   /* W25QXX_JEDEC / FontReady / WriteData：flashcn 烧录 + w25 命令 */
+#include "ui.h"       /* UI_Demo：oled 命令触发 OLED 演示屏 */
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -30,6 +32,11 @@ static uint8_t  s_rx_buf[RX_BUF_SIZE];
 static volatile uint8_t  s_rx_ready = 0;   /* 帧就绪标志：ISR 置位，主循环消费 */
 static volatile uint16_t s_rx_len   = 0;   /* 本帧字节数 */
 static uint32_t s_heartbeat_ms = 0;
+
+/* flashcn 烧录模式状态：进入后 Console_Process 把收到的帧当作二进制流直接写 W25Q */
+static uint8_t  s_flash_mode   = 0;   /* 1 = 正在接收二进制流写 W25Q */
+static uint32_t s_flash_total  = 0;   /* 期望接收总字节 */
+static uint32_t s_flash_offset = 0;   /* 已写入字节 */
 
 /* 阻塞发送：方案A 简单直接，发长串时会短暂占用主循环（115200 下几毫秒） */
 void Console_Tx(const uint8_t *buf, uint16_t len)
@@ -98,7 +105,7 @@ static void Shell_Exec(char *line)
 
   if (strcmp(line, "help") == 0)
   {
-    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n wdg [status|stop]\r\n");
+    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n wdg [status|stop]\r\n w25\r\n oled\r\n flashcn <size>\r\n");
   }
   else if (strcmp(line, "info") == 0)
   {
@@ -145,6 +152,34 @@ static void Shell_Exec(char *line)
       Console_Printf("usage: wdg [status|stop]\r\n");
     }
   }
+  else if (strcmp(line, "w25") == 0)
+  {
+    uint8_t id[3];
+    W25QXX_JEDEC(id);
+    Console_Printf("W25Q JEDEC %02X %02X %02X, cap=%lu B, font=%s\r\n",
+                   id[0], id[1], id[2],
+                   (unsigned long)W25QXX_CapacityBytes(),
+                   W25QXX_FontReady() ? "READY" : "none");
+  }
+  else if (strcmp(line, "oled") == 0)
+  {
+    UI_Demo();
+    Console_Printf("oled demo refreshed (font=%s)\r\n", W25QXX_FontReady() ? "READY" : "none");
+  }
+  else if (strncmp(line, "flashcn", 6) == 0 && (line[6] == ' ' || line[6] == '\0'))
+  {
+    /* 烧录字库：PC 侧把 [魔数4字节 + hzk16.bin] 流发进来。默认大小 261700 = 4 + 261696 */
+    uint32_t size = 261700;
+    sscanf(line, "flashcn %lu", &size);
+    if (size < 4) size = 4;
+    Console_Printf("FLASCN erase %lu bytes...\r\n", (unsigned long)size);
+    W25QXX_EraseRange(0, size);          /* 擦除字库区（阻塞；TIM2 ISR 仍喂狗，不会误复位） */
+    s_flash_offset = 0;
+    s_flash_total  = size;
+    s_flash_mode   = 1;
+    Console_Printf("FLASCN READY %lu\r\n", (unsigned long)size);
+    Console_Printf("send binary now (<=60B/frame); MCU ACKs each frame with '>'.\r\n");
+  }
   else
   {
     Console_Printf("unknown: %s (try 'help')\r\n", line);
@@ -154,12 +189,15 @@ static void Shell_Exec(char *line)
 /* 主循环调用：心跳日志 + 处理已收帧并重新启动 RX */
 void Console_Process(void)
 {
-  /* 5s 心跳：证明系统存活、日志通道通畅（由 TIM2 1ms 节拍驱动，非阻塞） */
+  /* 5s 心跳：证明系统存活、日志通道通畅（由 TIM2 1ms 节拍驱动，非阻塞）。
+     烧录模式下不打心跳，避免 '>' 之外多出字符污染二进制流。 */
   uint32_t now = g_systick_ms;
-  if (now - s_heartbeat_ms >= HEARTBEAT_MS)
+  if (!s_flash_mode && now - s_heartbeat_ms >= HEARTBEAT_MS)
   {
     s_heartbeat_ms = now;
-    Console_Printf("[hb] uptime=%lu s\r\n", (unsigned long)(now / 1000u));
+    Console_Printf("[hb] uptime=%lu s, font=%s\r\n",
+                   (unsigned long)(now / 1000u),
+                   W25QXX_FontReady() ? "OK" : "none");
   }
 
   if (!s_rx_ready)
@@ -175,6 +213,21 @@ void Console_Process(void)
   s_rx_ready = 0;
   __enable_irq();
   line[len] = '\0';
+
+  /* 烧录模式：收的是二进制流，不解析为命令，直接顺序写 W25Q，每帧回 ACK 节流 */
+  if (s_flash_mode)
+  {
+    W25QXX_WriteData(s_flash_offset, (const uint8_t *)line, len);
+    s_flash_offset += len;
+    Console_Tx((const uint8_t *)">", 1);
+    if (s_flash_offset >= s_flash_total)
+    {
+      s_flash_mode = 0;
+      Console_Printf("\r\nFLASCN DONE bytes=%lu\r\n", (unsigned long)s_flash_offset);
+    }
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, s_rx_buf, RX_BUF_SIZE);
+    return;
+  }
 
   Shell_Exec(line);
 
