@@ -13,6 +13,7 @@
 #include "usart.h"   /* huart1 (extern) */
 #include "key.h"     /* Key_SetAlarm / Key_GetAlarmState */
 #include "buzzer.h"  /* Buzzer_Beep：一次性蜂鸣（非阻塞） */
+#include "watchdog.h" /* WDG_Feed / WDG_TestHang：看门狗状态查询与复位验证 */
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -97,7 +98,7 @@ static void Shell_Exec(char *line)
 
   if (strcmp(line, "help") == 0)
   {
-    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n");
+    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n wdg [status|stop]\r\n");
   }
   else if (strcmp(line, "info") == 0)
   {
@@ -123,6 +124,26 @@ static void Shell_Exec(char *line)
     if (duty > 100) duty = 100;
     Buzzer_Beep((uint16_t)ms, (uint8_t)duty);   /* 一次性蜂鸣（非阻塞，ms 后自动停） */
     Console_Printf("beep %lu ms @ %u%%\r\n", ms, duty);
+  }
+  else if (strncmp(line, "wdg", 3) == 0 && (line[3] == ' ' || line[3] == '\0'))
+  {
+    if (strcmp(line, "wdg") == 0 || strcmp(line, "wdg status") == 0)
+    {
+      Console_Printf("IWDG active, timeout~1.5s, feeding=%s, feed_cnt=%lu, uptime=%lu s\r\n",
+                     WDG_IsFeeding() ? "ON" : "OFF",
+                     (unsigned long)WDG_FeedCount(),
+                     (unsigned long)(g_systick_ms / 1000u));
+    }
+    else if (strcmp(line, "wdg stop") == 0 || strcmp(line, "wdg test") == 0 ||
+             strcmp(line, "wdg hang") == 0)
+    {
+      Console_Printf("stop feeding IWDG and hang -> MCU will reset in ~1.5s\r\n");
+      WDG_TestHang();   /* 关喂狗 + 死循环，验证看门狗超时复位 */
+    }
+    else
+    {
+      Console_Printf("usage: wdg [status|stop]\r\n");
+    }
   }
   else
   {

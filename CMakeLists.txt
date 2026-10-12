@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/buzzer.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/key.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/console.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/watchdog.c
 )
 
 # Add include paths

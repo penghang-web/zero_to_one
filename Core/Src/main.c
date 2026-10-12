@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
+#include "iwdg.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -27,6 +28,7 @@
 /* USER CODE BEGIN Includes */
 #include "key.h"
 #include "console.h"
+#include "watchdog.h"   /* 阶段4：WDG_Feed 由 TIM2 节拍 ISR 调用 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -96,6 +98,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
   Console_RxStart();                   /* 启动 USART1 RX（IDLE+DMA 收帧） */
@@ -105,6 +108,10 @@ int main(void)
   /* 阶段3：启动系统节拍与蜂鸣器 PWM（PB1=TIM3_CH4） */
   HAL_TIM_Base_Start_IT(&htim2);                    /* TIM2 1ms 节拍中断 -> 累加 g_systick_ms */
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);         /* 蜂鸣器 PWM 运行，占空比初始 0 = 静音 */
+
+  /* 阶段4：调试期冻结 IWDG——ST-LINK 暂停在断点时看门狗不计数，
+   * 避免"断点被狗咬"误复位。仅调试器连接时生效，正常运行照常喂狗自愈。 */
+  __HAL_DBGMCU_FREEZE_IWDG();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -134,10 +141,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
@@ -174,6 +182,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM2)
   {
     g_systick_ms++;
+    /* 阶段4：IWDG 喂狗——每 500ms 喂一次（远小于 1.5s 超时），防误触发。
+     * 放在节拍 ISR 里契合指南"在节拍中断里定期喂狗"；若节拍卡死则狗会复位，正是自愈目的。 */
+    static uint32_t last_feed_ms = 0;
+    if (g_systick_ms - last_feed_ms >= 500U)
+    {
+      last_feed_ms = g_systick_ms;
+      WDG_Feed();
+    }
   }
 }
 /* USER CODE END 4 */
