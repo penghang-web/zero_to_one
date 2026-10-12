@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
+#include "i2c.h"
 #include "iwdg.h"
 #include "tim.h"
 #include "usart.h"
@@ -99,6 +100,7 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_IWDG_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
   Console_RxStart();                   /* 启动 USART1 RX（IDLE+DMA 收帧） */
