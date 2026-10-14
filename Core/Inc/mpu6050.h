@@ -97,6 +97,24 @@ HAL_StatusTypeDef MPU6050_SelfTestRegister(uint8_t *who_am_i);
   */
 HAL_StatusTypeDef MPU6050_ReadAll(MPU6050_RawData *data);
 
+/* -------------------------------------------------------------------------- */
+/* 5. 采样状态（供 UI / 控制台使用，由 MPU6050_Process 维护）                   */
+/* -------------------------------------------------------------------------- */
+extern MPU6050_RawData g_mpu;     /* 最新一次原始采样（主循环持续更新） */
+extern uint8_t         g_mpu_ok;  /* 1=已唤醒且 WHO_AM_I 匹配；0=未连/失连（Process 会重试） */
+
+/**
+  * @brief  初始化期检测：唤醒器件并比对 WHO_AM_I，成功置 g_mpu_ok=1 并打印状态。
+  *         失败则保持 g_mpu_ok=0，由 MPU6050_Process 周期重试（支持未接/热插拔自愈）。
+  */
+void MPU6050_Begin(void);
+
+/**
+  * @brief  主循环每圈调用：g_mpu_ok 时每 100ms 突发读 14 字节更新 g_mpu；
+  *         读取失败标记失连，转入每 5s 重试初始化。
+  */
+void MPU6050_Process(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -48,10 +48,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/buzzer.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/key.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/console.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/uart_driver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/watchdog.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/w25qxx.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/ssd1306.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/ui.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/mpu6050.c
 )
 

@@ -11,10 +11,15 @@
 #include "main.h"      /* 引脚/外设句柄所在 */
 #include "i2c.h"       /* hi2c1 (extern) */
 #include "w25qxx.h"    /* DrawCN 从 W25Q 读字库 */
+#include "mpu6050.h"   /* g_mpu / g_mpu_ok：MPU 三轴屏数据显示 */
 #include "font8x16.h"  /* 内置 ASCII 8x16 字模 */
 #include "font6x8.h"    /* 内置 ASCII 6x8 小字模（密集信息显示） */
 #include "stm32f1xx_hal.h"
 #include <string.h>     /* memset */
+#include <stdio.h>      /* snprintf：UI 屏格式化 */
+
+/* TIM2 1ms 节拍（main.c 维护），UI 屏切换/重绘节拍使用 */
+extern volatile uint32_t g_systick_ms;
 
 #define DEV       (SSD1306_I2C_ADDR << 1)   /* HAL 用 8 位地址（已左移） */
 #define I2C_TICK  100
@@ -23,20 +28,22 @@
 /* 1024 字节影子显存（128 列 x 64 行 / 8 行每字节） */
 static uint8_t s_buf[SSD1306_BUF_SIZE];
 
-/* ---- 底层 I2C 写：控制字节 0x00=命令, 0x40=数据 ---- */
+/* ---- 底层 I2C 写：控制字节 0x00=命令, 0x40=数据 ----
+ * 改用 I2C1_SafeMemWrite：自带 BUSY 检测 + 总线恢复 + 失败重试，
+ * 规避 STM32F1 I2C 外设锁死导致整个主循环卡死的缺陷。 */
 static void write_cmd(uint8_t c)
 {
-  HAL_I2C_Mem_Write(&hi2c1, DEV, 0x00, I2C_MEMADD_SIZE_8BIT, &c, 1, I2C_TICK);
+  I2C1_SafeMemWrite(DEV, 0x00, I2C_MEMADD_SIZE_8BIT, &c, 1);
 }
 static void write_cmds(const uint8_t *p, uint16_t n)
 {
   if (n == 0) return;
-  HAL_I2C_Mem_Write(&hi2c1, DEV, 0x00, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n, I2C_TICK);
+  I2C1_SafeMemWrite(DEV, 0x00, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n);
 }
 static void write_data(const uint8_t *p, uint16_t n)
 {
   if (n == 0) return;
-  HAL_I2C_Mem_Write(&hi2c1, DEV, 0x40, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n, I2C_TICK);
+  I2C1_SafeMemWrite(DEV, 0x40, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -50,7 +57,7 @@ void SSD1306_Init(void)
     0xD3, 0x00,       /* 显示偏移 0 */
     0x40,             /* 起始行 0 */
     0x8D, 0x14,       /* 电荷泵使能 */
-    0x20, 0x00,       /* 寻址模式：水平 */
+    0x20, 0x00,       /* 寻址模式：页（经典模式，Refresh 逐页设置页地址） */
     0xA1,             /* 段重映射（左右镜像，使字正向） */
     0xC8,             /* COM 扫描方向重映射 */
     0xDA, 0x12,       /* COM 引脚硬件配置（128x64 用 0x12） */
@@ -73,10 +80,17 @@ void SSD1306_Clear(void)
 
 void SSD1306_Refresh(void)
 {
-  /* 水平寻址模式下，先设定列/页窗口，再一次性送出 1024 字节 */
-  write_cmd(0x21); write_cmd(0);    write_cmd(SSD1306_WIDTH - 1);   /* 列 0..127 */
-  write_cmd(0x22); write_cmd(0);    write_cmd(SSD1306_HEIGHT / 8 - 1); /* 页 0..7 */
-  write_data(s_buf, SSD1306_BUF_SIZE);
+  /* 页寻址模式（init 设 0x20 0x00）下，SSD1306 写满一页后列地址回绕、
+   * 页地址不会自动递增。因此必须逐页显式设置页地址 + 列起始，再写 128 字节，
+   * 否则 8 次数据全堆在页 0，页 1~7 永远是残留值（花屏）。
+   * 单次 128 字节（≈12ms @100kHz）也远离 HAL 100ms 超时，不会中途 abort。 */
+  for (uint8_t page = 0; page < (SSD1306_HEIGHT / 8); page++)
+  {
+    write_cmd((uint8_t)(0xB0 + page));   /* 设置当前页 0..7 */
+    write_cmd(0x00);                      /* 列地址低位 = 0 */
+    write_cmd(0x10);                      /* 列地址高位 = 0 → 列 = 0 */
+    write_data(&s_buf[(uint16_t)page * SSD1306_WIDTH], SSD1306_WIDTH);
+  }
 }
 
 void SSD1306_DrawPixel(uint8_t x, uint8_t y, uint8_t color)
@@ -226,5 +240,130 @@ void SSD1306_DrawString6x8(uint8_t x, uint8_t y, const char *s, uint8_t color)
     SSD1306_DrawChar6x8(cx, y, (char)(*s), color);
     cx = (uint8_t)(cx + FONT6X8_W + SSD1306_CHAR_GAP);   /* 每个字符占 6 像素宽 + 3px 间隔 */
     s++;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 高层 UI：状态屏 / MPU 三轴屏 / 屏幕切换调度（原 ui.c 内容合并到本驱动文件） */
+/* -------------------------------------------------------------------------- */
+/* 布局规格（字符高度固定 16px）：
+ *   共 3 行，行间距 OLED_LINE_GAP = 3px，底部留白 64-(38+16) = 10px
+ *     行0 Y = 0
+ *     行1 Y = 0 + 16 + 3 = 19
+ *     行2 Y = 19 + 16 + 3 = 38
+ *   汉字 16px(宽)x16px(高)；ASCII/数字/符号 8px(宽)x16px(高)
+ *   （由 SSD1306_DrawString 按 GB2312 自动区分：双字节走 16x16、单字节走 8x16）
+ *
+ * 重要：字库是 GB2312 编码，而 C 源文件是 UTF-8，字符串字面量里的"中文"是
+ * UTF-8 字节、与字库对不上。因此中文标题用 Python 预先转成 GB2312 字节数组
+ * （见下方 s_title_gb），再交给 SSD1306_DrawString 按 GB2312 解析。
+ * 纯英文/数字串用普通字面量即可（ASCII 部分字节一致）。 */
+#define OLED_LINE_GAP  3       /* 行间距 */
+#define UI_LINE_H      16      /* 字符高度（汉字/英文 同行高） */
+#define UI_LINE0_Y     0
+#define UI_LINE1_Y     (UI_LINE0_Y + UI_LINE_H + OLED_LINE_GAP)   /* 0+16+3 = 19 */
+#define UI_LINE2_Y     (UI_LINE1_Y + UI_LINE_H + OLED_LINE_GAP)   /* 19+16+3 = 38 */
+/* 总占用：UI_LINE2_Y + UI_LINE_H = 38+16 = 54px；屏幕 64px，底部留白 10px */
+
+/* 迷你黑匣子 -> GB2312(C3 D4 C4 E3 BA DA CF BB D7 D3) */
+static const uint8_t s_title_gb[] = { 0xC3, 0xD4, 0xC4, 0xE3, 0xBA, 0xDA, 0xCF, 0xBB, 0xD7, 0xD3 };
+
+void SSD1306_UI_Init(void)
+{
+  SSD1306_Init();
+}
+
+void SSD1306_UI_Demo(void)
+{
+  SSD1306_Clear();
+
+  /* 行0（Y=0）：16x16 中文标题 */
+  SSD1306_DrawString(0, UI_LINE0_Y, (const char *)s_title_gb, 1);
+
+  /* 行1（Y=19）：版本 + 运行时长（8x16 ASCII） */
+  char line[24];
+  unsigned long sec = (unsigned long)(g_systick_ms / 1000u);
+  snprintf(line, sizeof(line), "MBB v1.0 %lu s", sec);
+  SSD1306_DrawString(0, UI_LINE1_Y, line, 1);
+
+  /* 行2（Y=38）：报警 + 字库状态（8x16 ASCII） */
+  snprintf(line, sizeof(line), "ALM:%s F:%s",
+           "OFF", W25QXX_FontReady() ? "READY" : "--");
+  SSD1306_DrawString(0, UI_LINE2_Y, line, 1);
+
+  SSD1306_Refresh();
+}
+
+void SSD1306_UI_Refresh(void)
+{
+  SSD1306_Refresh();
+}
+
+/* -------------------------------------------------------------------------- */
+/* MPU 三轴原始数据屏                                                          */
+/* 约束：同样遵循"字符高度固定 16px、3 行、行间距 3px、底部 10px 留白"规格。   */
+/* 128px 宽度约 11 字符/行，6 个轴(各 9 字符)放不下，故分两页每 2s 自动切换： */
+/*   页0(ACC)  : AX= / AY= / AZ=                                            */
+/*   页1(GYRO) : GX= / GY= / GZ=                                            */
+/* 标签首字母 A/G 即区分加速度/陀螺仪。未连接时显示 "MPU N/A"。               */
+void SSD1306_UI_MPU(void)
+{
+  SSD1306_Clear();
+
+  if (!g_mpu_ok)
+  {
+    SSD1306_DrawString(0, UI_LINE0_Y, "MPU N/A", 1);
+    SSD1306_Refresh();
+    return;
+  }
+
+  /* 每 2s 在 加速度(ACC) / 陀螺仪(GYRO) 两页间切换 */
+  uint8_t accel = ((g_systick_ms / 2000U) % 2U) == 0U;
+  char line[16];
+
+  if (accel)
+  {
+    snprintf(line, sizeof(line), "AX=%+6d", g_mpu.ax);
+    SSD1306_DrawString(0, UI_LINE0_Y, line, 1);
+    snprintf(line, sizeof(line), "AY=%+6d", g_mpu.ay);
+    SSD1306_DrawString(0, UI_LINE1_Y, line, 1);
+    snprintf(line, sizeof(line), "AZ=%+6d", g_mpu.az);
+    SSD1306_DrawString(0, UI_LINE2_Y, line, 1);
+  }
+  else
+  {
+    snprintf(line, sizeof(line), "GX=%+6d", g_mpu.gx);
+    SSD1306_DrawString(0, UI_LINE0_Y, line, 1);
+    snprintf(line, sizeof(line), "GY=%+6d", g_mpu.gy);
+    SSD1306_DrawString(0, UI_LINE1_Y, line, 1);
+    snprintf(line, sizeof(line), "GZ=%+6d", g_mpu.gz);
+    SSD1306_DrawString(0, UI_LINE2_Y, line, 1);
+  }
+
+  SSD1306_Refresh();
+}
+
+/* 主循环每圈调用：状态屏(SSD1306_UI_Demo) 与 MPU 屏(SSD1306_UI_MPU) 每 4s 交替；
+ * MPU 屏数据变化快，每 500ms 重绘；状态屏每 1s 重绘即可（原 main.c 调度逻辑下沉）。 */
+void SSD1306_UI_Process(void)
+{
+  static uint32_t s_oled_ms = 0;    /* 屏幕切换节拍 */
+  static uint32_t s_oled_draw = 0;  /* 当前屏重绘节拍 */
+  static uint8_t  s_oled_mode = 0;  /* 0=状态屏, 1=MPU屏 */
+
+  if (g_systick_ms - s_oled_ms >= 4000U)
+  {
+    s_oled_ms = g_systick_ms;
+    s_oled_mode ^= 1U;
+  }
+  /* MPU 屏数据变化快，每 500ms 重绘；状态屏每 1s 重绘即可 */
+  uint32_t period = (s_oled_mode == 1U) ? 500U : 1000U;
+  if (g_systick_ms - s_oled_draw >= period)
+  {
+    s_oled_draw = g_systick_ms;
+    if (s_oled_mode == 1U)
+      SSD1306_UI_MPU();
+    else
+      SSD1306_UI_Demo();
   }
 }

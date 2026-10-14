@@ -12,10 +12,12 @@ static volatile uint8_t s_feed_enable = 1;   /* 默认开启喂狗，系统正�
 static uint32_t        s_feed_count   = 0;   /* 喂狗累计次数（状态观测用） */
 
 /* 喂狗：写 KR=0xAAAA 重装计数器，防止 IWDG 超时复位。
- * 仅在 s_feed_enable 为真时执行；ISR 调用，短小且无阻塞。 */
+ * 仅在 s_feed_enable 为真、且 IWDG 已初始化（hiwdg.Instance != NULL）时执行；
+ * 调试期若关闭 MX_IWDG_Init，Instance 为 NULL，此处跳过以免访问空句柄崩溃。
+ * ISR 调用，短小且无阻塞。 */
 void WDG_Feed(void)
 {
-  if (s_feed_enable)
+  if (s_feed_enable && hiwdg.Instance != NULL)
   {
     HAL_IWDG_Refresh(&hiwdg);
     s_feed_count++;

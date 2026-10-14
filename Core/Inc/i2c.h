@@ -42,6 +42,15 @@ void MX_I2C1_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* STM32F1 I2C 总线恢复：BUSY 卡死或传输超时后调用，释放被从机拉低的 SDA 并复位外设 */
+void I2C1_BusRecovery(void);
+
+/* 安全 I2C 读写：传输前检测 BUSY 并恢复，失败自动重试一次，规避 F1 I2C 锁死缺陷 */
+HAL_StatusTypeDef I2C1_SafeMemWrite(uint16_t DevAddress, uint16_t MemAddress,
+                                    uint16_t MemAddSize, uint8_t *pData, uint16_t Size);
+HAL_StatusTypeDef I2C1_SafeMemRead(uint16_t DevAddress, uint16_t MemAddress,
+                                   uint16_t MemAddSize, uint8_t *pData, uint16_t Size);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

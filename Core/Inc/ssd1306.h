@@ -40,4 +40,13 @@ void SSD1306_DrawString(uint8_t x, uint8_t y, const char *s, uint8_t color);
 void SSD1306_DrawChar6x8(uint8_t x, uint8_t y, char c, uint8_t color);
 void SSD1306_DrawString6x8(uint8_t x, uint8_t y, const char *s, uint8_t color);
 
+/* -------------------------------------------------------------------------- */
+/* 高层 UI（状态屏 / MPU 三轴屏 / 屏幕切换调度），实现见 ssd1306.c
+ * 原 ui.c 内容合并到此，使 main 只负责初始化与调度，保持简洁 */
+void SSD1306_UI_Init(void);      /* 初始化 OLED（内部调 SSD1306_Init + Clear） */
+void SSD1306_UI_Demo(void);      /* 绘制状态屏（中英文混排）并立即刷屏 */
+void SSD1306_UI_MPU(void);       /* 绘制 MPU 三轴屏（ACC/GYRO 两页每 2s 切换）并刷屏 */
+void SSD1306_UI_Refresh(void);   /* 仅重刷当前显存（内容由 UI_Demo/UI_MPU 写入） */
+void SSD1306_UI_Process(void);   /* 主循环每圈调用：每 4s 切换状态屏/MPU屏，并按节拍重绘 */
+
 #endif /* SSD1306_H */

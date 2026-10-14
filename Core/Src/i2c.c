@@ -111,5 +111,94 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
 
 /* USER CODE BEGIN 1 */
 
+/* ===========================================================================
+ * STM32F1 I2C 总线恢复与安全读写
+ * ---------------------------------------------------------------------------
+ * STM32F1 的 I2C 外设有已知缺陷：一旦从机拉低 SDA（时钟拉伸/噪声/突发读被打断），
+ * I2C_FLAG_BUSY 会卡死，HAL 的 Mem_Read/Write 每次都等到超时返回却永不恢复，
+ * 进而导致所有共用该总线的设备（OLED + MPU6050）全部失效、主循环被阻塞卡死。
+ *
+ * 标准恢复手法：用 GPIO 模拟 9 个 SCL 脉冲，让从机把 SDA 释放出来，再产生 STOP，
+ * 最后 DeInit/Init 复位外设（MspInit 会把引脚重新配成 AF_OD）。
+ * ========================================================================= */
+void I2C1_BusRecovery(void)
+{
+  GPIO_InitTypeDef gpio = {0};
+
+  /* 1. 关闭 I2C 外设，避免恢复过程中硬件状态干扰 */
+  __HAL_I2C_DISABLE(&hi2c1);
+
+  /* 2. 把 SCL/PB6、SDA/PB7 临时配成开漏输出，由我们手动产生时钟 */
+  gpio.Pin  = GPIO_PIN_6 | GPIO_PIN_7;
+  gpio.Mode = GPIO_MODE_OUTPUT_OD;
+  gpio.Pull = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &gpio);
+
+  /* 先释放 SDA（输出高），SCL 也拉高 */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+  for (volatile uint32_t d = 0; d < 200; d++);
+
+  /* 3. 产生 9 个 SCL 脉冲，让仍占用总线的从机把数据位全部移出、松开 SDA */
+  for (int i = 0; i < 9; i++)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+    for (volatile uint32_t d = 0; d < 200; d++);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+    for (volatile uint32_t d = 0; d < 200; d++);
+  }
+
+  /* 4. 产生 STOP 条件：SCL 为高时，SDA 由低变高 */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+  for (volatile uint32_t d = 0; d < 200; d++);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+  for (volatile uint32_t d = 0; d < 200; d++);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+  for (volatile uint32_t d = 0; d < 200; d++);
+
+  /* 5. 复位 I2C 外设（HAL_I2C_Init 内部会调用 MspInit 重新把引脚配成 AF_OD） */
+  HAL_I2C_DeInit(&hi2c1);
+  HAL_I2C_Init(&hi2c1);
+}
+
+/* 安全 I2C 写：传输前若总线 BUSY 则先恢复；首次失败再恢复并重试一次 */
+HAL_StatusTypeDef I2C1_SafeMemWrite(uint16_t DevAddress, uint16_t MemAddress,
+                                    uint16_t MemAddSize, uint8_t *pData, uint16_t Size)
+{
+  if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY))
+  {
+    I2C1_BusRecovery();
+  }
+  HAL_StatusTypeDef st = HAL_I2C_Mem_Write(&hi2c1, DevAddress, MemAddress,
+                                          MemAddSize, pData, Size, 100);
+  if (st != HAL_OK)
+  {
+    I2C1_BusRecovery();
+    st = HAL_I2C_Mem_Write(&hi2c1, DevAddress, MemAddress,
+                           MemAddSize, pData, Size, 100);
+  }
+  return st;
+}
+
+/* 安全 I2C 读：与写同理，失败自动恢复并重试 */
+HAL_StatusTypeDef I2C1_SafeMemRead(uint16_t DevAddress, uint16_t MemAddress,
+                                   uint16_t MemAddSize, uint8_t *pData, uint16_t Size)
+{
+  if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY))
+  {
+    I2C1_BusRecovery();
+  }
+  HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, DevAddress, MemAddress,
+                                         MemAddSize, pData, Size, 100);
+  if (st != HAL_OK)
+  {
+    I2C1_BusRecovery();
+    st = HAL_I2C_Mem_Read(&hi2c1, DevAddress, MemAddress,
+                          MemAddSize, pData, Size, 100);
+  }
+  return st;
+}
+
 /* USER CODE END 1 */
 

@@ -1,21 +1,20 @@
 /**
   ******************************************************************************
   * @file    console.c
-  * @brief   USART1 控制台：printf 日志 + IDLE+DMA 收帧 + 简易 Shell（方案A）
+  * @brief   USART1 控制台：printf 日志 + 命令行 Shell + flashcn 烧录
+  * @note    收发由 uart_driver 接管（中断 + 环形缓冲，非阻塞，带错误恢复）。
+  *          本文件不再使用 HAL_UART_Receive_IT / HAL_UART_Transmit 等阻塞/单次接口，
+  *          统一通过 uart_driver 的 UART_IRQHandler、UART_ReadRaw、UART_Send 完成。
   ******************************************************************************
-  *
- * 接收：HAL_UART_Receive_IT 单字节中断把数据搬进 s_rx_buf，遇换行或超时(主循环判定)
- *       成帧；ISR 内只记账并立即重新武装中断（规避 DMA+IDLE 在 F1 上的重武装隐患）。
- * 发送：方案A 用阻塞 HAL_UART_Transmit；printf 用 vsnprintf 格式化后发送。
- * 处理：Console_Process 在主循环里取帧、回显(echo)、解析命令。
   */
 #include "console.h"
+#include "uart_driver.h"   /* g_uart1（本文件定义） + UART_* API */
 #include "usart.h"   /* huart1 (extern) */
 #include "key.h"     /* Key_SetAlarm / Key_GetAlarmState */
 #include "buzzer.h"  /* Buzzer_Beep：一次性蜂鸣（非阻塞） */
 #include "watchdog.h" /* WDG_Feed / WDG_TestHang：看门狗状态查询与复位验证 */
 #include "w25qxx.h"   /* W25QXX_JEDEC / FontReady / WriteData：flashcn 烧录 + w25 命令 */
-#include "ui.h"       /* UI_Demo：oled 命令触发 OLED 演示屏 */
+#include "ssd1306.h"   /* SSD1306_UI_Demo：oled 命令触发 OLED 演示屏 */
 #include "mpu6050.h"  /* 阶段6：MPU6050 原始数据打印 */
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
@@ -23,45 +22,63 @@
 #include <string.h>
 
 extern volatile uint32_t g_systick_ms;   /* TIM2 1ms 节拍，main.c 维护 */
-extern MPU6050_RawData g_mpu;            /* 阶段6：最新采样，main.c 维护 */
-extern uint8_t g_mpu_ok;                 /* 阶段6：MPU 是否已唤醒并识别成功 */
+/* g_mpu / g_mpu_ok 已由 mpu6050.h 通过 extern 声明（定义于 mpu6050.c），此处不再重复 */
 
-#define RX_BUF_SIZE  128
-#define TX_BUF_SIZE  128
+/* ---- UART 驱动实例与缓冲（由 uart_driver 接管 USART1 收发）---- */
+UART_Driver_t g_uart1;
+static uint8_t s_uart_rx[512];   /* 接收环形缓冲（≥2 的幂，远大于 60 字节/帧） */
+static uint8_t s_uart_tx[256];   /* 发送环形缓冲 */
+
 #define HEARTBEAT_MS 5000
-#define RX_IDLE_MS       20   /* 文本帧超时成帧（无换行时兜底） */
-#define RX_FLASH_IDLE_MS  5   /* 烧录二进制帧超时成帧（字节间隔） */
+#define LINE_MAX     160          /* 命令行缓冲（含烧录可能的较长行） */
 
-/* ---- 模块私有 ---- */
-static uint8_t  s_rx_buf[RX_BUF_SIZE];
-static volatile uint8_t  s_rx_ready = 0;   /* 文本帧就绪（遇换行置位），主循环消费 */
-static volatile uint16_t s_rx_len   = 0;   /* 已收字节数 */
-static uint8_t  s_rx_byte;                 /* 单字节中断收数暂存 */
-static volatile uint32_t s_last_rx_ms = 0; /* 最近一字节到达时刻（超时成帧用） */
-static uint32_t s_heartbeat_ms = 0;
-
-/* flashcn 烧录模式状态：进入后 Console_Process 把收到的帧当作二进制流直接写 W25Q */
+/* flashcn 烧录模式状态：进入后 Console_Process 把收到的二进制流写 W25Q，每 60 字节回 '>' */
 static uint8_t  s_flash_mode   = 0;   /* 1 = 正在接收二进制流写 W25Q */
 static uint32_t s_flash_total  = 0;   /* 期望接收总字节 */
 static uint32_t s_flash_offset = 0;   /* 已写入字节 */
+static uint8_t  s_flash_buf[128];     /* 累积接收的二进制帧，按 60 字节切 */
+static uint16_t s_flash_buf_len = 0;
 
 /* mpu 持续打印流：'mpu on' 开启后每 500ms 打印一行原始三轴数据 */
 static uint8_t  s_mpu_stream   = 0;
 
-/* 阻塞发送：方案A 简单直接，发长串时会短暂占用主循环（115200 下几毫秒） */
+/* 命令行汇编缓冲（命令模式使用） */
+static char     s_line[LINE_MAX + 1];
+static uint16_t s_line_len = 0;
+
+/* 阻塞发送：把数据压入 uart_driver 发送环形缓冲，由 TXE 中断非阻塞发出。
+ * 若发送缓冲暂时满了，短自旋等待 ISR 腾出空间（带上限防止极端情况下死循环）。 */
 void Console_Tx(const uint8_t *buf, uint16_t len)
 {
-  if (len == 0 || buf == NULL)
+  if (buf == NULL || len == 0)
   {
     return;
   }
-  HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, HAL_MAX_DELAY);
+  const uint8_t *p = buf;
+  uint16_t rem = len;
+  uint32_t guard = 0;
+  while (rem > 0)
+  {
+    uint16_t free = UART_GetTxFree(&g_uart1);
+    if (free > 0)
+    {
+      uint16_t n = (rem < free) ? rem : free;
+      UART_Send(&g_uart1, p, n);
+      p += n;
+      rem -= n;
+      guard = 0;
+    }
+    else if (++guard > 2000000U)
+    {
+      break;   /* 极端异常（如中断未接管）时主动放弃，避免主循环卡死 */
+    }
+  }
 }
 
 /* printf 风格日志：格式化进局部缓冲再发送（字符串保持 ASCII，中文走注释） */
 void Console_Printf(const char *fmt, ...)
 {
-  static char tbuf[TX_BUF_SIZE];
+  static char tbuf[LINE_MAX];
   va_list ap;
 
   va_start(ap, fmt);
@@ -74,36 +91,19 @@ void Console_Printf(const char *fmt, ...)
   }
 }
 
-/* RX 单字节中断回调：每收到 1 字节追加到缓冲，遇换行立即成帧，并重新武装 IT。
-   用中断（非 DMA）收数，规避 HAL_UARTEx_ReceiveToIdle_DMA 在 F1 上的重武装/IDLE 隐患。 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    if (s_rx_len < RX_BUF_SIZE)
-    {
-      s_rx_buf[s_rx_len++] = s_rx_byte;
-    }
-    s_last_rx_ms = g_systick_ms;
-    if (s_rx_byte == '\n' || s_rx_byte == '\r')
-    {
-      if (s_rx_len > 1)          /* 避免单纯回车成空帧 */
-      {
-        s_rx_ready = 1;
-      }
-    }
-    HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1);   /* 重新武装，准备收下一字节 */
-  }
-}
-
-/* 启动 RX：USART 初始化后调用一次；之后每字节由中断自动重新武装 */
+/* 启动 RX：USART 初始化后调用一次；初始化 uart_driver（接管收发中断）。
+ * 之后每字节由 UART_IRQHandler 自动写入环形缓冲，无需手动重武装。 */
 void Console_RxStart(void)
 {
-  s_rx_ready = 0;
-  s_rx_len   = 0;
-  if (HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1) != HAL_OK)
+  UART_DriverConfig_t cfg = {0};
+  cfg.rx_buf  = s_uart_rx;
+  cfg.rx_size = (uint16_t)sizeof(s_uart_rx);
+  cfg.tx_buf  = s_uart_tx;
+  cfg.tx_size = (uint16_t)sizeof(s_uart_tx);
+  /* frame 全零 = 原始流模式：UART_ReadRaw 直接取字节，帧界定交给上层（命令行/烧录） */
+  if (UART_Init(&g_uart1, &huart1, &cfg) != HAL_OK)
   {
-    /* 启动失败暂不处理，留待后续错误恢复专题 */
+    /* 初始化失败暂不处理，留待后续错误恢复专题 */
   }
 }
 
@@ -112,7 +112,11 @@ static void Shell_Exec(char *line)
 {
   /* 去掉结尾的 \r / \n，方便解析与回显 */
   size_t len = strlen(line);
-  /* 去除前导空白/控制字符（防御 DMA 帧偶尔带前导垃圾，导致命令词识别失败） */
+  while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n'))
+  {
+    line[--len] = '\0';
+  }
+  /* 去除前导空白/控制字符（防御偶尔带前导垃圾，导致命令词识别失败） */
   size_t start = 0;
   while (start < len && (line[start] == ' ' || line[start] == '\t' || line[start] < 0x20U))
   {
@@ -122,10 +126,6 @@ static void Shell_Exec(char *line)
   {
     memmove(line, line + start, len - start + 1);
     len -= start;
-  }
-  while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n'))
-  {
-    line[--len] = '\0';
   }
 
   /* 回显收到的行（验证 TX/RX 双通） */
@@ -169,7 +169,7 @@ static void Shell_Exec(char *line)
   {
     if (strcmp(line, "wdg") == 0 || strcmp(line, "wdg status") == 0)
     {
-      Console_Printf("IWDG active, timeout~1.5s, feeding=%s, feed_cnt=%lu, uptime=%lu s\r\n",
+      Console_Printf("IWDG active, feeding=%s, feed_cnt=%lu, uptime=%lu s\r\n",
                      WDG_IsFeeding() ? "ON" : "OFF",
                      (unsigned long)WDG_FeedCount(),
                      (unsigned long)(g_systick_ms / 1000u));
@@ -196,7 +196,7 @@ static void Shell_Exec(char *line)
   }
   else if (strcmp(line, "oled") == 0)
   {
-    UI_Demo();
+    SSD1306_UI_Demo();
     Console_Printf("oled demo refreshed (font=%s)\r\n", W25QXX_FontReady() ? "READY" : "none");
   }
   else if (strncmp(line, "mpu", 3) == 0 && (line[3] == ' ' || line[3] == '\0'))
@@ -245,6 +245,7 @@ static void Shell_Exec(char *line)
     W25QXX_EraseRange(0, size);          /* 擦除字库区（阻塞；TIM2 ISR 仍喂狗，不会误复位） */
     s_flash_offset = 0;
     s_flash_total  = size;
+    s_flash_buf_len = 0;
     s_flash_mode   = 1;
     Console_Printf("FLASCN READY %lu\r\n", (unsigned long)size);
     Console_Printf("send binary now (<=60B/frame); MCU ACKs each frame with '>'.\r\n");
@@ -260,12 +261,15 @@ static void Shell_Exec(char *line)
   }
 }
 
-/* 主循环调用：心跳日志 + 处理已收帧并重新启动 RX */
+/* 主循环调用：心跳日志 + 处理已收数据（命令行/烧录二进制流） */
 void Console_Process(void)
 {
+  static uint32_t s_heartbeat_ms = 0;
+  static uint32_t s_mpu_print_ms = 0;
+  uint32_t now = g_systick_ms;
+
   /* 5s 心跳：证明系统存活、日志通道通畅（由 TIM2 1ms 节拍驱动，非阻塞）。
      烧录模式下不打心跳，避免 '>' 之外多出字符污染二进制流。 */
-  uint32_t now = g_systick_ms;
   if (!s_flash_mode && now - s_heartbeat_ms >= HEARTBEAT_MS)
   {
     s_heartbeat_ms = now;
@@ -276,7 +280,6 @@ void Console_Process(void)
 
   /* mpu 持续打印流：'mpu on' 开启后每 500ms 打印一次原始三轴数据。
      主循环已持续把采样写进 g_mpu，这里只负责按节拍输出（烧录模式不打，避免污染二进制流）。 */
-  static uint32_t s_mpu_print_ms = 0;
   if (s_mpu_stream && !s_flash_mode && g_mpu_ok && now - s_mpu_print_ms >= 500U)
   {
     s_mpu_print_ms = now;
@@ -284,61 +287,66 @@ void Console_Process(void)
                    g_mpu.ax, g_mpu.ay, g_mpu.az, g_mpu.gx, g_mpu.gy, g_mpu.gz);
   }
 
-  /* 判断是否有完整帧：
-     文本命令 —— 遇换行立即成帧（s_rx_ready）；
-     烧录二进制 —— 靠字节间隔超时成帧（RX_FLASH_IDLE_MS）；
-     兜底 —— 文本无换行时 RX_IDLE_MS 超时成帧。 */
-  uint8_t  frame_ready = 0;
-  uint16_t len = 0;
-  __disable_irq();
+  /* ---- 烧录模式：收的是二进制流，按 60 字节/帧顺序写 W25Q，每帧回 '>' 节流 ---- */
   if (s_flash_mode)
   {
-    if (s_rx_len > 0 && (now - s_last_rx_ms) >= RX_FLASH_IDLE_MS)
+    uint8_t tmp[128];
+    uint16_t got = UART_ReadRaw(&g_uart1, tmp, (uint16_t)sizeof(tmp));
+    if (got > 0)
     {
-      frame_ready = 1;
-      len = s_rx_len;
+      /* 累积进 flash 缓冲（防止单圈只到半帧） */
+      for (uint16_t i = 0; i < got && s_flash_buf_len < (uint16_t)sizeof(s_flash_buf); i++)
+      {
+        s_flash_buf[s_flash_buf_len++] = tmp[i];
+      }
+      /* 凑满一帧（60 字节，或最后一帧不足 60）即写 W25Q 并回 '>' */
+      uint16_t frame = (s_flash_offset + 60U <= s_flash_total)
+                            ? 60U : (uint16_t)(s_flash_total - s_flash_offset);
+      while (s_flash_buf_len >= frame && s_flash_offset < s_flash_total)
+      {
+        W25QXX_WriteData(s_flash_offset, s_flash_buf, frame);
+        s_flash_offset += frame;
+        memmove(s_flash_buf, s_flash_buf + frame, (size_t)(s_flash_buf_len - frame));
+        s_flash_buf_len -= frame;
+        Console_Tx((const uint8_t *)">", 1);
+        frame = (s_flash_offset + 60U <= s_flash_total)
+                    ? 60U : (uint16_t)(s_flash_total - s_flash_offset);
+      }
+      if (s_flash_offset >= s_flash_total)
+      {
+        s_flash_mode = 0;
+        Console_Printf("\r\nFLASCN DONE bytes=%lu\r\n", (unsigned long)s_flash_offset);
+      }
     }
-  }
-  else
-  {
-    if (s_rx_ready)
-    {
-      frame_ready = 1;
-      len = s_rx_len;
-    }
-    else if (s_rx_len > 0 && (now - s_last_rx_ms) >= RX_IDLE_MS)
-    {
-      frame_ready = 1;
-      len = s_rx_len;
-    }
-  }
-  if (!frame_ready)
-  {
-    return;
-  }
-
-  /* 拷出帧数据并清缓冲标志（ISR 仍在收后续字节，不影响本次处理） */
-  char line[RX_BUF_SIZE + 1];
-  memcpy(line, s_rx_buf, len);
-  s_rx_len   = 0;
-  s_rx_ready = 0;
-  __enable_irq();
-  line[len] = '\0';
-
-  /* 烧录模式：收的是二进制流，顺序写 W25Q，每帧回 '>' 节流 */
-  if (s_flash_mode)
-  {
-    W25QXX_WriteData(s_flash_offset, (const uint8_t *)line, len);
-    s_flash_offset += len;
-    Console_Tx((const uint8_t *)">", 1);
-    if (s_flash_offset >= s_flash_total)
-    {
-      s_flash_mode = 0;
-      Console_Printf("\r\nFLASCN DONE bytes=%lu\r\n", (unsigned long)s_flash_offset);
-    }
-    return;   /* RX 由中断持续武装，无需手动重开 */
+    return;   /* RX 由 uart_driver 持续接收，无需手动重开 */
   }
 
-  Shell_Exec(line);
-  /* 文本命令处理完即返回；RX 由中断持续武装 */
+  /* ---- 命令模式：把收到的原始字节汇编成行（遇 \n / \r 结束） ---- */
+  uint8_t tmp[LINE_MAX];
+  uint16_t got = UART_ReadRaw(&g_uart1, tmp, (uint16_t)sizeof(tmp));
+  if (got > 0)
+  {
+    for (uint16_t i = 0; i < got; i++)
+    {
+      uint8_t c = tmp[i];
+      if (c == '\n' || c == '\r')
+      {
+        if (s_line_len > 0)
+        {
+          s_line[s_line_len] = '\0';
+          Shell_Exec(s_line);   /* Shell_Exec 内部会再做一次 trim */
+          s_line_len = 0;
+        }
+        /* 连续 \r\n 不产生空行 */
+      }
+      else if (c == '\b' || c == 0x7F)   /* 退格 / DEL：删除一个字符 */
+      {
+        if (s_line_len > 0) s_line_len--;
+      }
+      else if (s_line_len < LINE_MAX)
+      {
+        s_line[s_line_len++] = (char)c;
+      }
+    }
+  }
 }
