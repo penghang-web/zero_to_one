@@ -52,13 +52,55 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+/* ── HardFault 诊断陷阱（无调试器也能定位崩溃点）──
+ * 通过 USART1 轮询打印故障现场，不依赖任何中断（故障态下也可用）。
+ * 打印完回到默认死循环，等 IWDG(~26s) 或手动复位。
+ * 仅用于诊断；正常不应进 HardFault。 */
+static void hf_uart_putc(char c)
+{
+  USART_TypeDef *u = USART1;
+  uint32_t t = 0U;
+  while (!(u->SR & 0x80U))          /* 等 TXE */
+  {
+    if (++t > 2000000U) return;     /* USART 未就绪则放弃，避免死等 */
+  }
+  u->DR = (uint8_t)c;
+}
+static void hf_uart_puts(const char *s)
+{
+  while (*s) hf_uart_putc(*s++);
+}
+static void hf_uart_hex(uint32_t v)
+{
+  hf_uart_puts("0x");
+  for (int i = 7; i >= 0; i--)
+  {
+    uint32_t n = (v >> (uint32_t)(i * 4U)) & 0xFU;
+    hf_uart_putc((char)((n < 10U) ? ('0' + n) : ('A' + n - 10U)));
+  }
+}
+/* sp = 故障现场栈帧指针；exc_lr = 进入 HardFault 时的 EXC_RETURN（bit2 指示用 MSP/PSP） */
+static void hf_dump_fault(uint32_t *sp, uint32_t exc_lr)
+{
+  uint32_t pc = sp[6];        /* 栈帧顺序: R0,R1,R2,R3,R12,LR,PC,xPSR */
+  uint32_t lr_fault = sp[5];
+  SCB_Type *scb = SCB;
+  (void)exc_lr;
+  hf_uart_puts("\r\n[HardFault] PC="); hf_uart_hex(pc);
+  hf_uart_puts(" LR=");        hf_uart_hex(lr_fault);
+  hf_uart_puts(" CFSR=");      hf_uart_hex(scb->CFSR);
+  hf_uart_puts(" MMFAR=");     hf_uart_hex(scb->MMFAR);
+  hf_uart_puts(" BFAR=");       hf_uart_hex(scb->BFAR);
+  hf_uart_puts("\r\n");
+}
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
 extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_usart1_rx;
 extern UART_HandleTypeDef huart1;
+extern TIM_HandleTypeDef htim4;
+
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -87,7 +129,16 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  /* 取故障现场栈帧：进 HardFault 时 LR=EXC_RETURN，
+   * bit2(0x4) 指示栈帧在 PSP(线程栈) 还是 MSP(主栈)。 */
+  uint32_t lr_val;
+  uint32_t *sp;
+  __asm volatile ("MOV %0, LR" : "=r" (lr_val));
+  if ((lr_val & 0x4U) != 0U)
+    __asm volatile ("MRS %0, PSP" : "=r" (sp));
+  else
+    __asm volatile ("MRS %0, MSP" : "=r" (sp));
+  hf_dump_fault(sp, lr_val);   /* 通过 USART1 打印 PC/LR/CFSR/MMFAR/BFAR */
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -142,19 +193,6 @@ void UsageFault_Handler(void)
 }
 
 /**
-  * @brief This function handles System service call via SWI instruction.
-  */
-void SVC_Handler(void)
-{
-  /* USER CODE BEGIN SVCall_IRQn 0 */
-
-  /* USER CODE END SVCall_IRQn 0 */
-  /* USER CODE BEGIN SVCall_IRQn 1 */
-
-  /* USER CODE END SVCall_IRQn 1 */
-}
-
-/**
   * @brief This function handles Debug monitor.
   */
 void DebugMon_Handler(void)
@@ -165,33 +203,6 @@ void DebugMon_Handler(void)
   /* USER CODE BEGIN DebugMonitor_IRQn 1 */
 
   /* USER CODE END DebugMonitor_IRQn 1 */
-}
-
-/**
-  * @brief This function handles Pendable request for system service.
-  */
-void PendSV_Handler(void)
-{
-  /* USER CODE BEGIN PendSV_IRQn 0 */
-
-  /* USER CODE END PendSV_IRQn 0 */
-  /* USER CODE BEGIN PendSV_IRQn 1 */
-
-  /* USER CODE END PendSV_IRQn 1 */
-}
-
-/**
-  * @brief This function handles System tick timer.
-  */
-void SysTick_Handler(void)
-{
-  /* USER CODE BEGIN SysTick_IRQn 0 */
-
-  /* USER CODE END SysTick_IRQn 0 */
-  HAL_IncTick();
-  /* USER CODE BEGIN SysTick_IRQn 1 */
-
-  /* USER CODE END SysTick_IRQn 1 */
 }
 
 /******************************************************************************/
@@ -244,12 +255,31 @@ void TIM2_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles TIM4 global interrupt.
+  */
+void TIM4_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM4_IRQn 0 */
+
+  /* USER CODE END TIM4_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim4);
+  /* USER CODE BEGIN TIM4_IRQn 1 */
+
+  /* USER CODE END TIM4_IRQn 1 */
+}
+
+/**
   * @brief This function handles USART1 global interrupt.
   */
 void USART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART1_IRQn 0 */
-
+  /* ★ 必须走自定义 UART_IRQHandler：它负责清 IDLE 标志(在 HAL_UART_IRQHandler
+   *   之前)，并把其余 RX/TX/错误转交 HAL_UART_IRQHandler。
+   *   若直接调 HAL_UART_IRQHandler，IDLE 标志永不清 → ISR 风暴 → 系统卡死 →
+   *   IWDG 超时复位（表现即"发数据就重启"）。详见 uart_driver.h 注释。 */
+  UART_IRQHandler(&g_uart1);
+  return;   /* 跳过下方生成的 HAL_UART_IRQHandler 重复调用 */
   /* USER CODE END USART1_IRQn 0 */
   HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */
