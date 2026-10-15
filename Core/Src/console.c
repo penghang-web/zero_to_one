@@ -1,10 +1,10 @@
 /**
   ******************************************************************************
   * @file    console.c
-  * @brief   USART1 控制台：printf 日志 + 命令行 Shell + flashcn 烧录
-  * @note    收发由 uart_driver 接管（中断 + 环形缓冲，非阻塞，带错误恢复）。
-  *          本文件不再使用 HAL_UART_Receive_IT / HAL_UART_Transmit 等阻塞/单次接口，
-  *          统一通过 uart_driver 的 UART_IRQHandler、UART_ReadRaw、UART_Send 完成。
+  * @brief   USART1 控制台：printf 日志 + 命令行 Shell
+ * @note    收发由 uart_driver 接管（DMA 循环接收 + 环形缓冲，非阻塞，带错误恢复）。
+ *          本文件不再使用 HAL_UART_Receive_IT / HAL_UART_Transmit 等阻塞/单次接口，
+ *          统一通过 uart_driver 的 UART_IRQHandler、UART_ReadRaw、UART_Send 完成。
   ******************************************************************************
   */
 #include "console.h"
@@ -13,7 +13,6 @@
 #include "key.h"     /* Key_SetAlarm / Key_GetAlarmState */
 #include "buzzer.h"  /* Buzzer_Beep：一次性蜂鸣（非阻塞） */
 #include "watchdog.h" /* WDG_Feed / WDG_TestHang：看门狗状态查询与复位验证 */
-#include "w25qxx.h"   /* W25QXX_JEDEC / FontReady / WriteData：flashcn 烧录 + w25 命令 */
 #include "ssd1306.h"   /* SSD1306_UI_Demo：oled 命令触发 OLED 演示屏 */
 #include "mpu6050.h"  /* 阶段6：MPU6050 原始数据打印 */
 #include "stm32f1xx_hal.h"
@@ -30,14 +29,7 @@ static uint8_t s_uart_rx[512];   /* 接收环形缓冲（≥2 的幂，远大于
 static uint8_t s_uart_tx[256];   /* 发送环形缓冲 */
 
 #define HEARTBEAT_MS 5000
-#define LINE_MAX     160          /* 命令行缓冲（含烧录可能的较长行） */
-
-/* flashcn 烧录模式状态：进入后 Console_Process 把收到的二进制流写 W25Q，每 60 字节回 '>' */
-static uint8_t  s_flash_mode   = 0;   /* 1 = 正在接收二进制流写 W25Q */
-static uint32_t s_flash_total  = 0;   /* 期望接收总字节 */
-static uint32_t s_flash_offset = 0;   /* 已写入字节 */
-static uint8_t  s_flash_buf[128];     /* 累积接收的二进制帧，按 60 字节切 */
-static uint16_t s_flash_buf_len = 0;
+#define LINE_MAX     160          /* 命令行缓冲 */
 
 /* mpu 持续打印流：'mpu on' 开启后每 500ms 打印一行原始三轴数据 */
 static uint8_t  s_mpu_stream   = 0;
@@ -91,8 +83,9 @@ void Console_Printf(const char *fmt, ...)
   }
 }
 
-/* 启动 RX：USART 初始化后调用一次；初始化 uart_driver（接管收发中断）。
- * 之后每字节由 UART_IRQHandler 自动写入环形缓冲，无需手动重武装。 */
+/* 启动 RX：USART 初始化后调用一次；初始化 uart_driver（接管收发）。
+ * 之后 DMA 循环把串口数据直接写入环形缓冲，IDLE 线中断负责"一帧收完"通知，
+ * 全程非阻塞、零拷贝，无需每字节中断或手动重武装。 */
 void Console_RxStart(void)
 {
   UART_DriverConfig_t cfg = {0};
@@ -138,7 +131,7 @@ static void Shell_Exec(char *line)
 
   if (strcmp(line, "help") == 0)
   {
-    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n wdg [status|stop]\r\n w25\r\n oled\r\n flashcn <size>\r\n mpu [on|off]\r\n");
+    Console_Printf("Commands:\r\n help\r\n info\r\n led on\r\n led off\r\n beep <ms> [duty]\r\n wdg [status|stop]\r\n oled\r\n mpu [on|off]\r\n");
   }
   else if (strcmp(line, "info") == 0)
   {
@@ -185,19 +178,10 @@ static void Shell_Exec(char *line)
       Console_Printf("usage: wdg [status|stop]\r\n");
     }
   }
-  else if (strcmp(line, "w25") == 0)
-  {
-    uint8_t id[3];
-    W25QXX_JEDEC(id);
-    Console_Printf("W25Q JEDEC %02X %02X %02X, cap=%lu B, font=%s\r\n",
-                   id[0], id[1], id[2],
-                   (unsigned long)W25QXX_CapacityBytes(),
-                   W25QXX_FontReady() ? "READY" : "none");
-  }
   else if (strcmp(line, "oled") == 0)
   {
     SSD1306_UI_Demo();
-    Console_Printf("oled demo refreshed (font=%s)\r\n", W25QXX_FontReady() ? "READY" : "none");
+    Console_Printf("oled demo refreshed\r\n");
   }
   else if (strncmp(line, "mpu", 3) == 0 && (line[3] == ' ' || line[3] == '\0'))
   {
@@ -232,24 +216,7 @@ static void Shell_Exec(char *line)
       Console_Printf("usage: mpu | mpu on | mpu off\r\n");
     }
   }
-  else if (strncmp(line, "flashcn", 6) == 0)
-  {
-    /* 烧录字库：PC 侧把 [魔数4字节 + hzk16.bin] 流发进来。默认大小 261700 = 4 + 261696 */
-    uint32_t size = 261700;
-    if (line[6] == ' ')
-    {
-      sscanf(line + 7, "%lu", &size);
-    }
-    if (size < 4) size = 4;
-    Console_Printf("FLASCN erase %lu bytes...\r\n", (unsigned long)size);
-    W25QXX_EraseRange(0, size);          /* 擦除字库区（阻塞；TIM2 ISR 仍喂狗，不会误复位） */
-    s_flash_offset = 0;
-    s_flash_total  = size;
-    s_flash_buf_len = 0;
-    s_flash_mode   = 1;
-    Console_Printf("FLASCN READY %lu\r\n", (unsigned long)size);
-    Console_Printf("send binary now (<=60B/frame); MCU ACKs each frame with '>'.\r\n");
-  }
+  /* flashcn 字库烧录功能已移除（不再依赖 W25Q 字库，仅英文/ASCII 显示） */
   else
   {
     Console_Printf("unknown: %s (try 'help') [hex", line);
@@ -266,59 +233,38 @@ void Console_Process(void)
 {
   static uint32_t s_heartbeat_ms = 0;
   static uint32_t s_mpu_print_ms = 0;
+  static uint32_t s_last_rx_ms   = 0;   /* 最近一次收到字节的时间戳，用于空闲自动提交 */
   uint32_t now = g_systick_ms;
 
-  /* 5s 心跳：证明系统存活、日志通道通畅（由 TIM2 1ms 节拍驱动，非阻塞）。
-     烧录模式下不打心跳，避免 '>' 之外多出字符污染二进制流。 */
-  if (!s_flash_mode && now - s_heartbeat_ms >= HEARTBEAT_MS)
+  /* ---- RX 链路自愈（兜底，DMA 循环接收）----
+   * 正常接收由 DMA 直接搬入 rx_buf，IDLE 线中断负责"一帧收完"通知。
+   * 若 HAL 因 ORE/PE/FE 等串口错误把 DMA 通道关闭，后续字节便永久收不到
+   * （表现即“首字节后无响应 / 点发送没反应”）。这里每圈主循环检测一次：
+   * DMA 通道使能位(CCR.EN)若被清掉，就强制回 READY 并重启 DMA 循环接收，
+   * 开销极小，可兜住任何静态分析之外的卡死。 */
+  if (huart1.hdmarx == NULL ||
+      (huart1.hdmarx->Instance->CCR & DMA_CCR_EN) == 0U)
+  {
+    huart1.RxState = HAL_UART_STATE_READY;
+    (void)HAL_UART_Receive_DMA(&huart1, g_uart1.rx_buf, g_uart1.rx_size);
+    __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+  }
+
+  /* 5s 心跳：证明系统存活、日志通道通畅（由 TIM2 1ms 节拍驱动，非阻塞） */
+  if (now - s_heartbeat_ms >= HEARTBEAT_MS)
   {
     s_heartbeat_ms = now;
-    Console_Printf("[hb] uptime=%lu s, font=%s\r\n",
-                   (unsigned long)(now / 1000u),
-                   W25QXX_FontReady() ? "OK" : "none");
+    Console_Printf("[hb] uptime=%lu s\r\n",
+                   (unsigned long)(now / 1000u));
   }
 
   /* mpu 持续打印流：'mpu on' 开启后每 500ms 打印一次原始三轴数据。
      主循环已持续把采样写进 g_mpu，这里只负责按节拍输出（烧录模式不打，避免污染二进制流）。 */
-  if (s_mpu_stream && !s_flash_mode && g_mpu_ok && now - s_mpu_print_ms >= 500U)
+  if (s_mpu_stream && g_mpu_ok && now - s_mpu_print_ms >= 500U)
   {
     s_mpu_print_ms = now;
     Console_Printf("MPU ax=%d ay=%d az=%d gx=%d gy=%d gz=%d\r\n",
                    g_mpu.ax, g_mpu.ay, g_mpu.az, g_mpu.gx, g_mpu.gy, g_mpu.gz);
-  }
-
-  /* ---- 烧录模式：收的是二进制流，按 60 字节/帧顺序写 W25Q，每帧回 '>' 节流 ---- */
-  if (s_flash_mode)
-  {
-    uint8_t tmp[128];
-    uint16_t got = UART_ReadRaw(&g_uart1, tmp, (uint16_t)sizeof(tmp));
-    if (got > 0)
-    {
-      /* 累积进 flash 缓冲（防止单圈只到半帧） */
-      for (uint16_t i = 0; i < got && s_flash_buf_len < (uint16_t)sizeof(s_flash_buf); i++)
-      {
-        s_flash_buf[s_flash_buf_len++] = tmp[i];
-      }
-      /* 凑满一帧（60 字节，或最后一帧不足 60）即写 W25Q 并回 '>' */
-      uint16_t frame = (s_flash_offset + 60U <= s_flash_total)
-                            ? 60U : (uint16_t)(s_flash_total - s_flash_offset);
-      while (s_flash_buf_len >= frame && s_flash_offset < s_flash_total)
-      {
-        W25QXX_WriteData(s_flash_offset, s_flash_buf, frame);
-        s_flash_offset += frame;
-        memmove(s_flash_buf, s_flash_buf + frame, (size_t)(s_flash_buf_len - frame));
-        s_flash_buf_len -= frame;
-        Console_Tx((const uint8_t *)">", 1);
-        frame = (s_flash_offset + 60U <= s_flash_total)
-                    ? 60U : (uint16_t)(s_flash_total - s_flash_offset);
-      }
-      if (s_flash_offset >= s_flash_total)
-      {
-        s_flash_mode = 0;
-        Console_Printf("\r\nFLASCN DONE bytes=%lu\r\n", (unsigned long)s_flash_offset);
-      }
-    }
-    return;   /* RX 由 uart_driver 持续接收，无需手动重开 */
   }
 
   /* ---- 命令模式：把收到的原始字节汇编成行（遇 \n / \r 结束） ---- */
@@ -326,6 +272,7 @@ void Console_Process(void)
   uint16_t got = UART_ReadRaw(&g_uart1, tmp, (uint16_t)sizeof(tmp));
   if (got > 0)
   {
+    s_last_rx_ms = now;   /* 记录最近收字节时间，供下方空闲自动提交判断 */
     for (uint16_t i = 0; i < got; i++)
     {
       uint8_t c = tmp[i];
@@ -348,5 +295,17 @@ void Console_Process(void)
         s_line[s_line_len++] = (char)c;
       }
     }
+  }
+
+  /* 空闲自动提交：串口助手的"发送"按钮常整段突发发送、且不带换行符，
+   * 若只等 \n/\r，命令行会永远堆在缓冲里不执行（表现即"点了发送没反应"）。
+   * 这里：只要缓冲里有未提交内容、且距最近一个字节已空闲 250ms，就自动提交。
+   * 115200bps 下 250ms 可收约 2800 字节，远大于单条命令，不会把一条命令拆断；
+   * 交互式逐字符输入每字符间隔>250ms 才会触发，本场景不会误触发。 */
+  if (s_line_len > 0 && (now - s_last_rx_ms) >= 250U)
+  {
+    s_line[s_line_len] = '\0';
+    Shell_Exec(s_line);
+    s_line_len = 0;
   }
 }

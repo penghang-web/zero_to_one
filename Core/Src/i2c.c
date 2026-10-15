@@ -111,6 +111,17 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
 
 /* USER CODE BEGIN 1 */
 
+/* TIM2 1ms 节拍（main.c 维护），用于 BusRecovery 冷却限频 */
+extern volatile uint32_t g_systick_ms;
+
+/* I2C 单次传输超时：调小到 50ms，既保证总线偶发卡顿时不会长时间阻塞主循环，
+ * 又给安全读写/重试留出余量（失败 1 次 + 重试 1 次最坏 ~100ms + 恢复开销）。 */
+#define I2C_TIMEOUT_MS   50
+
+/* BusRecovery 冷却：避免总线持续锁死时"每次调用都 DeInit/Init 重活"雪崩，
+ * 把单圈 I2C 阻塞时间压在门控窗口内。冷却期内直接快速失败。 */
+static uint32_t s_last_recovery_ms = 0;
+
 /* ===========================================================================
  * STM32F1 I2C 总线恢复与安全读写
  * ---------------------------------------------------------------------------
@@ -162,21 +173,34 @@ void I2C1_BusRecovery(void)
   HAL_I2C_Init(&hi2c1);
 }
 
-/* 安全 I2C 写：传输前若总线 BUSY 则先恢复；首次失败再恢复并重试一次 */
+/* 安全 I2C 写：传输前若总线 BUSY 则先恢复；首次失败再恢复并重试一次。
+ * 冷却期内（距上次恢复 <300ms）不重复重活，直接快速失败，交由看门狗门控兜底。 */
 HAL_StatusTypeDef I2C1_SafeMemWrite(uint16_t DevAddress, uint16_t MemAddress,
                                     uint16_t MemAddSize, uint8_t *pData, uint16_t Size)
 {
   if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY))
   {
-    I2C1_BusRecovery();
+    if (g_systick_ms - s_last_recovery_ms >= 300U)
+    {
+      I2C1_BusRecovery();
+      s_last_recovery_ms = g_systick_ms;
+    }
+    else
+    {
+      return HAL_BUSY;   /* 冷却期内直接失败，避免主循环被反复恢复拖死 */
+    }
   }
   HAL_StatusTypeDef st = HAL_I2C_Mem_Write(&hi2c1, DevAddress, MemAddress,
-                                          MemAddSize, pData, Size, 100);
+                                          MemAddSize, pData, Size, I2C_TIMEOUT_MS);
   if (st != HAL_OK)
   {
-    I2C1_BusRecovery();
+    if (g_systick_ms - s_last_recovery_ms >= 300U)
+    {
+      I2C1_BusRecovery();
+      s_last_recovery_ms = g_systick_ms;
+    }
     st = HAL_I2C_Mem_Write(&hi2c1, DevAddress, MemAddress,
-                           MemAddSize, pData, Size, 100);
+                           MemAddSize, pData, Size, I2C_TIMEOUT_MS);
   }
   return st;
 }
@@ -187,15 +211,27 @@ HAL_StatusTypeDef I2C1_SafeMemRead(uint16_t DevAddress, uint16_t MemAddress,
 {
   if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY))
   {
-    I2C1_BusRecovery();
+    if (g_systick_ms - s_last_recovery_ms >= 300U)
+    {
+      I2C1_BusRecovery();
+      s_last_recovery_ms = g_systick_ms;
+    }
+    else
+    {
+      return HAL_BUSY;
+    }
   }
   HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, DevAddress, MemAddress,
-                                         MemAddSize, pData, Size, 100);
+                                         MemAddSize, pData, Size, I2C_TIMEOUT_MS);
   if (st != HAL_OK)
   {
-    I2C1_BusRecovery();
+    if (g_systick_ms - s_last_recovery_ms >= 300U)
+    {
+      I2C1_BusRecovery();
+      s_last_recovery_ms = g_systick_ms;
+    }
     st = HAL_I2C_Mem_Read(&hi2c1, DevAddress, MemAddress,
-                          MemAddSize, pData, Size, 100);
+                          MemAddSize, pData, Size, I2C_TIMEOUT_MS);
   }
   return st;
 }

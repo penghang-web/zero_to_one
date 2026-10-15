@@ -2,9 +2,9 @@
   ******************************************************************************
   * @file    uart_driver.h
   * @brief   基于 STM32 HAL 的稳健 UART 驱动（中断 + 环形缓冲 FIFO）
-  * @note    设计要点：
-  *          - 接收：RXNE(每字节) + IDLE(帧空闲) 中断，数据持续写入接收环形缓冲；
-  *                    不使用 HAL_UART_Receive_IT 这种"定长单次接收"模型。
+ * @note    设计要点：
+ *          - 接收：DMA 循环搬运(直接写入接收环形缓冲) + IDLE(帧空闲) 中断；
+ *                    不使用 HAL_UART_Receive_IT 这种"每字节单次接收"模型(已删除)。
   *          - 发送：TXE 中断驱动，数据先压入发送环形缓冲，非阻塞发出。
   *          - 帧解析：支持可选 帧头 / 长度字段 / 帧尾，简单帧提取。
   *          - 错误处理：溢出(ORE)/奇偶(PE)/帧(FE)/噪声(NE) 错误自动恢复。
@@ -70,6 +70,7 @@ typedef struct {
     uint16_t       tx_size;      /* 发送缓冲大小(建议 2 的幂，≥2) */
     volatile uint16_t tx_head;   /* 应用写：下一个存入位置 */
     volatile uint16_t tx_tail;   /* ISR 读：下一个取出位置 */
+    volatile uint16_t tx_sending;/* 当前 HAL_UART_Transmit_IT 正在发送的字节数 */
     volatile bool   tx_ongoing;  /* 发送进行中(TXE 中断已开启) */
 
     /* 统计与状态 */
@@ -94,9 +95,14 @@ typedef struct {
 /* ============================== 对外 API ============================== */
 
 /**
-  * @brief  初始化 UART 驱动：绑定 huart，挂载收发环形缓冲，开启 RXNE+IDLE 中断。
-  * @note   huart 须已由 CubeMX(MX_USARTx_UART_Init) 初始化完成；
-  *         本函数不调用 HAL_UART_Receive_IT，改用直接寄存器操作持续接收。
+  * @brief  初始化 UART 驱动：绑定 huart，挂载收发环形缓冲，开启持续接收。
+  * @note   huart 须已由 CubeMX(MX_USARTx_UART_Init) 初始化完成。
+ *         接收采用 HAL_UART_Receive_DMA 循环搬运，DMA 直接把串口数据写入接收环形
+ *         缓冲；IDLE 线中断触发"帧收完"通知(frame_cb / frame_ready)。无需每字节
+ *         中断、无需手动重武装，CPU 占用最低(连续、非阻塞、零拷贝)。
+  *         发送采用 HAL_UART_Transmit_IT + 发送环形缓冲(非阻塞)。
+  *         本驱动的 UART_IRQHandler 作为薄包装转调 HAL_UART_IRQHandler，
+  *         由其统一处理 RX/TX/错误。
   * @retval HAL_OK 成功；参数非法返回 HAL_ERROR。
   */
 HAL_StatusTypeDef UART_Init(UART_Driver_t *drv, UART_HandleTypeDef *huart,
@@ -108,9 +114,10 @@ HAL_StatusTypeDef UART_Init(UART_Driver_t *drv, UART_HandleTypeDef *huart,
 void UART_DeInit(UART_Driver_t *drv);
 
 /**
-  * @brief  ★ 中断入口：在你的 USARTx_IRQHandler 中调用本函数，取代 HAL_UART_IRQHandler。
-  * @note   统一处理 RXNE / IDLE / TXE / 错误。务必在 stm32f1xx_it.c 的对应
-  *         USARTx_IRQHandler 内调用 UART_IRQHandler(&g_uartX)。
+  * @brief  ★ 中断入口：在 stm32f1xx_it.c 的 USARTx_IRQHandler 内调用本函数。
+ * @note   本函数先处理 IDLE 线中断(自己开启，HAL 不处理)：清 IDLE 标志并调用 frame_cb；
+ *         其余(RX=DMA 搬运完成/半完成 / TX=Transmit_IT→TxCpltCallback / 错误)转交 HAL_UART_IRQHandler(huart)。
+  *         务必调用 UART_IRQHandler(&g_uartX) 而非直接 HAL_UART_IRQHandler。
   */
 void UART_IRQHandler(UART_Driver_t *drv);
 

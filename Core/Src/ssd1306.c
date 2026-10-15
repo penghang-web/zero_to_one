@@ -1,7 +1,7 @@
 /**
   ******************************************************************************
   * @file    ssd1306.c
-  * @brief   SSD1306 OLED 驱动（I2C1，128x64，阻塞模式），含中英文混排绘制
+  * @brief   SSD1306 OLED 驱动（I2C1，128x64，阻塞模式），含 ASCII 英文字符串绘制
   ******************************************************************************
   *
   * I2C 命令约定：控制字节 0x00=后续为命令，0x40=后续为显存数据。
@@ -10,7 +10,6 @@
 #include "ssd1306.h"
 #include "main.h"      /* 引脚/外设句柄所在 */
 #include "i2c.h"       /* hi2c1 (extern) */
-#include "w25qxx.h"    /* DrawCN 从 W25Q 读字库 */
 #include "mpu6050.h"   /* g_mpu / g_mpu_ok：MPU 三轴屏数据显示 */
 #include "font8x16.h"  /* 内置 ASCII 8x16 字模 */
 #include "font6x8.h"    /* 内置 ASCII 6x8 小字模（密集信息显示） */
@@ -30,20 +29,21 @@ static uint8_t s_buf[SSD1306_BUF_SIZE];
 
 /* ---- 底层 I2C 写：控制字节 0x00=命令, 0x40=数据 ----
  * 改用 I2C1_SafeMemWrite：自带 BUSY 检测 + 总线恢复 + 失败重试，
- * 规避 STM32F1 I2C 外设锁死导致整个主循环卡死的缺陷。 */
-static void write_cmd(uint8_t c)
+ * 规避 STM32F1 I2C 外设锁死导致整个主循环卡死的缺陷。
+ * 返回 HAL 状态，便于 Refresh 在失败时及时跳出、避免把整圈拖死。 */
+static HAL_StatusTypeDef write_cmd(uint8_t c)
 {
-  I2C1_SafeMemWrite(DEV, 0x00, I2C_MEMADD_SIZE_8BIT, &c, 1);
+  return I2C1_SafeMemWrite(DEV, 0x00, I2C_MEMADD_SIZE_8BIT, &c, 1);
 }
-static void write_cmds(const uint8_t *p, uint16_t n)
+static HAL_StatusTypeDef write_cmds(const uint8_t *p, uint16_t n)
 {
-  if (n == 0) return;
-  I2C1_SafeMemWrite(DEV, 0x00, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n);
+  if (n == 0) return HAL_OK;
+  return I2C1_SafeMemWrite(DEV, 0x00, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n);
 }
-static void write_data(const uint8_t *p, uint16_t n)
+static HAL_StatusTypeDef write_data(const uint8_t *p, uint16_t n)
 {
-  if (n == 0) return;
-  I2C1_SafeMemWrite(DEV, 0x40, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n);
+  if (n == 0) return HAL_OK;
+  return I2C1_SafeMemWrite(DEV, 0x40, I2C_MEMADD_SIZE_8BIT, (uint8_t *)p, n);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -83,13 +83,14 @@ void SSD1306_Refresh(void)
   /* 页寻址模式（init 设 0x20 0x00）下，SSD1306 写满一页后列地址回绕、
    * 页地址不会自动递增。因此必须逐页显式设置页地址 + 列起始，再写 128 字节，
    * 否则 8 次数据全堆在页 0，页 1~7 永远是残留值（花屏）。
-   * 单次 128 字节（≈12ms @100kHz）也远离 HAL 100ms 超时，不会中途 abort。 */
+   * 任一次 I2C 失败即跳出本圈刷新（后续节拍再重试），避免 8 页全走 BusRecovery
+   * 把主循环单圈拖到看门狗门控窗口（1s）以上，导致反复误复位。 */
   for (uint8_t page = 0; page < (SSD1306_HEIGHT / 8); page++)
   {
-    write_cmd((uint8_t)(0xB0 + page));   /* 设置当前页 0..7 */
-    write_cmd(0x00);                      /* 列地址低位 = 0 */
-    write_cmd(0x10);                      /* 列地址高位 = 0 → 列 = 0 */
-    write_data(&s_buf[(uint16_t)page * SSD1306_WIDTH], SSD1306_WIDTH);
+    if (write_cmd((uint8_t)(0xB0 + page)) != HAL_OK) break;   /* 设置当前页 0..7 */
+    if (write_cmd(0x00) != HAL_OK) break;                      /* 列地址低位 = 0 */
+    if (write_cmd(0x10) != HAL_OK) break;                      /* 列地址高位 = 0 → 列 = 0 */
+    if (write_data(&s_buf[(uint16_t)page * SSD1306_WIDTH], SSD1306_WIDTH) != HAL_OK) break;
   }
 }
 
@@ -131,53 +132,6 @@ void SSD1306_DrawChar(uint8_t x, uint8_t y, char c, uint8_t color)
   }
 }
 
-void SSD1306_DrawCN(uint8_t x, uint8_t y, uint8_t qu, uint8_t wei, uint8_t color)
-{
-  uint8_t glyph[32];
-  int ok = W25QXX_ReadGlyph16x16(qu, wei, glyph);
-
-  /* 字库未烧录（读回全 0xFF）或读取失败：画占位框，便于先验证 I2C 连线 */
-  int blank = 1;
-  for (int i = 0; i < 32; i++)
-  {
-    if (glyph[i] != 0xFF) { blank = 0; break; }
-  }
-  if (ok != W25QXX_OK || blank)
-  {
-    for (uint8_t i = 0; i < 16; i++)
-    {
-      SSD1306_DrawPixel(x,           (uint8_t)(y + i), color);
-      SSD1306_DrawPixel((uint8_t)(x + 15), (uint8_t)(y + i), color);
-      SSD1306_DrawPixel((uint8_t)(x + i), y,       color);
-      SSD1306_DrawPixel((uint8_t)(x + i), (uint8_t)(y + 15), color);
-    }
-    return;
-  }
-
-  /* 正常：16 行，每行 2 字节（16 位），bit15..bit0 = 左..右 */
-  for (uint8_t row = 0; row < 16; row++)
-  {
-    uint8_t b0 = glyph[row * 2];
-    uint8_t b1 = glyph[row * 2 + 1];
-    for (uint8_t col = 0; col < 16; col++)
-    {
-      uint8_t bit;
-      if (col < 8)
-      {
-        bit = (b0 >> (7 - col)) & 0x01U;
-      }
-      else
-      {
-        bit = (b1 >> (7 - (col - 8))) & 0x01U;
-      }
-      if (bit)
-      {
-        SSD1306_DrawPixel((uint8_t)(x + col), (uint8_t)(y + row), color);
-      }
-    }
-  }
-}
-
 void SSD1306_DrawString(uint8_t x, uint8_t y, const char *s, uint8_t color)
 {
   if (s == NULL)
@@ -187,22 +141,10 @@ void SSD1306_DrawString(uint8_t x, uint8_t y, const char *s, uint8_t color)
   uint8_t cx = x;
   while (*s)
   {
-    uint8_t b = (uint8_t)(*s);
-    if (b >= 0xA1U)
-    {
-      /* GB2312 双字节汉字：当前为区码(qu)，下一字节为位码(wei) */
-      uint8_t qu = b;
-      uint8_t wei = (uint8_t)(*(s + 1));
-      SSD1306_DrawCN(cx, y, qu, wei, color);
-      cx = (uint8_t)(cx + 16 + SSD1306_CHAR_GAP);
-      s += 2;
-    }
-    else
-    {
-      SSD1306_DrawChar(cx, y, (char)b, color);
-      cx = (uint8_t)(cx + 8 + SSD1306_CHAR_GAP);
-      s += 1;
-    }
+    /* 仅支持 ASCII：逐字节按 8x16 字模绘制（中文显示已移除） */
+    SSD1306_DrawChar(cx, y, (char)(*s), color);
+    cx = (uint8_t)(cx + 8 + SSD1306_CHAR_GAP);
+    s++;
   }
 }
 
@@ -251,13 +193,8 @@ void SSD1306_DrawString6x8(uint8_t x, uint8_t y, const char *s, uint8_t color)
  *     行0 Y = 0
  *     行1 Y = 0 + 16 + 3 = 19
  *     行2 Y = 19 + 16 + 3 = 38
- *   汉字 16px(宽)x16px(高)；ASCII/数字/符号 8px(宽)x16px(高)
- *   （由 SSD1306_DrawString 按 GB2312 自动区分：双字节走 16x16、单字节走 8x16）
- *
- * 重要：字库是 GB2312 编码，而 C 源文件是 UTF-8，字符串字面量里的"中文"是
- * UTF-8 字节、与字库对不上。因此中文标题用 Python 预先转成 GB2312 字节数组
- * （见下方 s_title_gb），再交给 SSD1306_DrawString 按 GB2312 解析。
- * 纯英文/数字串用普通字面量即可（ASCII 部分字节一致）。 */
+ *   仅 ASCII/数字/符号，8px(宽)x16px(高)
+ *   （由 SSD1306_DrawString 逐字节按 8x16 字模绘制；中文显示已移除，标题使用英文） */
 #define OLED_LINE_GAP  3       /* 行间距 */
 #define UI_LINE_H      16      /* 字符高度（汉字/英文 同行高） */
 #define UI_LINE0_Y     0
@@ -265,8 +202,9 @@ void SSD1306_DrawString6x8(uint8_t x, uint8_t y, const char *s, uint8_t color)
 #define UI_LINE2_Y     (UI_LINE1_Y + UI_LINE_H + OLED_LINE_GAP)   /* 19+16+3 = 38 */
 /* 总占用：UI_LINE2_Y + UI_LINE_H = 38+16 = 54px；屏幕 64px，底部留白 10px */
 
-/* 迷你黑匣子 -> GB2312(C3 D4 C4 E3 BA DA CF BB D7 D3) */
-static const uint8_t s_title_gb[] = { 0xC3, 0xD4, 0xC4, 0xE3, 0xBA, 0xDA, 0xCF, 0xBB, 0xD7, 0xD3 };
+/* 英文标题：替代中文"迷你黑匣子"，避免依赖 W25Q 字库（供"先英文显示"场景）。
+ * SSD1306_DrawString 对纯 ASCII 串按 8x16 渲染，无需字库。 */
+static const char *s_title_en = "MiniBlackBox";
 
 void SSD1306_UI_Init(void)
 {
@@ -277,8 +215,8 @@ void SSD1306_UI_Demo(void)
 {
   SSD1306_Clear();
 
-  /* 行0（Y=0）：16x16 中文标题 */
-  SSD1306_DrawString(0, UI_LINE0_Y, (const char *)s_title_gb, 1);
+  /* 行0（Y=0）：英文标题（无需字库） */
+  SSD1306_DrawString(0, UI_LINE0_Y, s_title_en, 1);
 
   /* 行1（Y=19）：版本 + 运行时长（8x16 ASCII） */
   char line[24];
@@ -287,8 +225,7 @@ void SSD1306_UI_Demo(void)
   SSD1306_DrawString(0, UI_LINE1_Y, line, 1);
 
   /* 行2（Y=38）：报警 + 字库状态（8x16 ASCII） */
-  snprintf(line, sizeof(line), "ALM:%s F:%s",
-           "OFF", W25QXX_FontReady() ? "READY" : "--");
+  snprintf(line, sizeof(line), "ALM:%s", "OFF");
   SSD1306_DrawString(0, UI_LINE2_Y, line, 1);
 
   SSD1306_Refresh();

@@ -7,6 +7,11 @@
   ******************************************************************************
   */
 #include "uart_driver.h"
+#include "stm32f1xx_hal_dma.h"   /* __HAL_DMA_GET_COUNTER / DMA_CCR_EN 等 DMA 宏 */
+
+/* 当前激活的 UART 实例（UART_Init 时记录），供 HAL 回调定位驱动。
+ * 本项目仅一个 USART1，单实例即可；多实例可改为数组/链表。 */
+static UART_Driver_t *s_active = NULL;
 
 /* ===========================================================================
  * 临界区工具：Cortex-M3 上 16 位环形索引读写本身是原子的，但为了防止
@@ -28,19 +33,6 @@ static inline void uart_exit_critical(uint32_t pm)
 /* ===========================================================================
  * 环形缓冲内部工具
  * ========================================================================= */
-
-/* 接收：ISR 中调用，写入一个字节；满则丢弃并计数(防溢出) */
-static inline void uart_rx_put(UART_Driver_t *d, uint8_t b)
-{
-    uint16_t next = (uint16_t)(d->rx_head + 1U) % d->rx_size;
-    if (next == d->rx_tail)        /* 缓冲满，丢弃新字节并记录 */
-    {
-        d->rx_overflow++;
-        return;
-    }
-    d->rx_buf[d->rx_head] = b;
-    d->rx_head = next;
-}
 
 /* 在环形缓冲区域 [start, start+len) 中从 0 偏移起匹配 pattern，
  * 返回匹配的相对偏移；未找到返回 -1。 */
@@ -65,6 +57,19 @@ static int uart_find_pattern(const uint8_t *buf, uint16_t size,
             return (int)i;
     }
     return -1;
+}
+
+/* DMA circular 模式下，串口数据已由 DMA 实时刻写入 rx_buf；
+ * rx_head 须反映 DMA 当前写入位置 = rx_size - NDTR(剩余未传字节数)。
+ * 在读取共享索引(rx_head)前调用，使软件环形缓冲视角与硬件 DMA 一致。
+ * 注：DMA 是总线主控，不受 PRIMASK 影响；此处仅在临界区内取一次快照即可。 */
+static inline void uart_sync_rx_head(UART_Driver_t *d)
+{
+    if (d->huart->hdmarx != NULL)
+    {
+        d->rx_head = (uint16_t)(d->rx_size
+                  - __HAL_DMA_GET_COUNTER(d->huart->hdmarx));
+    }
 }
 
 /* ===========================================================================
@@ -213,6 +218,7 @@ HAL_StatusTypeDef UART_Init(UART_Driver_t *drv, UART_HandleTypeDef *huart,
     drv->tx_size     = cfg->tx_size;
     drv->tx_head     = 0U;
     drv->tx_tail     = 0U;
+    drv->tx_sending  = 0U;
     drv->tx_ongoing  = false;
     drv->rx_overflow = 0U;
     drv->err_count   = 0U;
@@ -220,8 +226,18 @@ HAL_StatusTypeDef UART_Init(UART_Driver_t *drv, UART_HandleTypeDef *huart,
     drv->frame       = cfg->frame;
     drv->frame_cb    = cfg->frame_cb;
 
-    /* 开启接收中断(RXNE)与空闲中断(IDLE)；发送中断(TXE)在有数据时才开 */
-    SET_BIT(huart->Instance->CR1, USART_CR1_RXNEIE | USART_CR1_IDLEIE);
+    /* 记录当前激活实例，供 HAL 回调(TxCplt/Error)定位驱动 */
+    s_active = drv;
+
+    /* 开启 DMA 循环接收：DMA 直接把串口数据搬进 rx_buf(全程零拷贝、无每字节中断)。
+     * IDLE 线中断单独使能，由 UART_IRQHandler 检测"一帧收完"并通知上层。
+     * 注意：DMA circular 模式下若消费不及时，最旧数据会被覆盖(环形缓冲固有行为)，
+     *       本项目 rx_buf=512 远大于单帧，正常主循环消费足够快，可接受。 */
+    if (HAL_UART_Receive_DMA(huart, drv->rx_buf, drv->rx_size) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+    __HAL_UART_ENABLE_IT(huart, UART_IT_IDLE);
     return HAL_OK;
 }
 
@@ -229,10 +245,13 @@ void UART_DeInit(UART_Driver_t *drv)
 {
     if (drv == NULL || drv->huart == NULL)
         return;
-    CLEAR_BIT(drv->huart->Instance->CR1,
-              USART_CR1_RXNEIE | USART_CR1_IDLEIE | USART_CR1_TXEIE);
+    /* 停止 DMA 循环接收并复位状态 */
+    (void)HAL_UART_Abort(drv->huart);
+    if (s_active == drv)
+        s_active = NULL;   /* 撤销激活实例记录，避免残留 ISR 指向已失效驱动 */
     drv->rx_head = drv->rx_tail = 0U;
     drv->tx_head = drv->tx_tail = 0U;
+    drv->tx_sending = 0U;
     drv->tx_ongoing = false;
     drv->frame_ready = false;
 }
@@ -241,58 +260,72 @@ void UART_IRQHandler(UART_Driver_t *drv)
 {
     if (drv == NULL || drv->huart == NULL)
         return;
-
-    USART_TypeDef *inst = drv->huart->Instance;
-    uint32_t sr = inst->SR;   /* 读 SR(清 IDLE/ORE 等需先读 SR) */
-
-    /* 1) 错误处理：溢出(ORE)/奇偶(PE)/帧(FE)/噪声(NE)
-     *    F1 上清除方式：读 SR(已读) 再读 DR。读 DR 会顺带清掉 IDLE。 */
-    if (sr & (UART_FLAG_ORE | UART_FLAG_PE | UART_FLAG_FE | UART_FLAG_NE))
+    UART_HandleTypeDef *huart = drv->huart;
+    /* IDLE 线中断：总线静默超过 1 个字符时间后触发，表示"一帧已收完"。
+     * 它由我们自己开启，HAL_UART_IRQHandler 不处理它，须在此手动清标志并通知。 */
+    if (__HAL_UART_GET_FLAG(huart, UART_FLAG_IDLE))
     {
-        (void)inst->DR;              /* 读 DR 清除错误标志 */
-        drv->err_count++;
-        /* 重新确保接收中断开启(异常后防止 RXNE 被关闭导致永久死收) */
-        SET_BIT(inst->CR1, USART_CR1_RXNEIE | USART_CR1_IDLEIE);
-    }
-
-    /* 2) 接收数据：循环排空 RDR，避免只处理一次漏掉后续字节 */
-    if (sr & UART_FLAG_RXNE)
-    {
-        while (inst->SR & UART_FLAG_RXNE)
-        {
-            uint8_t b = (uint8_t)inst->DR;
-            uart_rx_put(drv, b);
-        }
-    }
-
-    /* 3) 空闲中断：一帧结束的标志 */
-    if (sr & UART_FLAG_IDLE)
-    {
-        (void)inst->DR;             /* 读 DR 清除 IDLE 标志 */
-        drv->frame_ready = true;
+        __HAL_UART_CLEAR_IDLEFLAG(huart);   /* 读 SR + 读 DR 清 IDLE 标志 */
+        drv->frame_ready = true;            /* 帧就绪提示(供 UART_FrameReady 读取) */
         if (drv->frame_cb != NULL)
-            drv->frame_cb();
+        {
+            drv->frame_cb();                /* 帧就绪回调(唤醒上层任务等) */
+        }
     }
+    /* 其余(RX=DMA 搬运完成/半完成、TX=Transmit_IT→TxCpltCallback、错误)交给 HAL */
+    HAL_UART_IRQHandler(huart);
+}
 
-    /* 4) 发送：TDR 空，从发送环形缓冲取字节发出 */
-    if (sr & UART_FLAG_TXE)
+/* ===========================================================================
+ * HAL 回调（覆盖 HAL 的 __weak 默认实现）
+ *   仅处理本驱动激活的 UART；其余 UART(如有)不受影响。
+ * ========================================================================= */
+/* 错误处理回调：STM32 HAL 在出现 ORE/PE/FE/NE 等串口错误时，
+ * 默认只置错误标志、关闭 RX 并调用本弱函数（默认空实现），
+ * 若不在此恢复，DMA 循环接收会在首次出错后永久停摆——表现就是"板子能发心跳、
+ * 但串口助手发的命令收不到任何回显/响应"（这正是本次"点了发送没反应"的根因）。
+ * 这里清错误标志并重新启动 DMA 循环接收 + IDLE 中断，使链路在噪声/溢出后能自愈。 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  UART_Driver_t *drv = s_active;
+  if (drv == NULL || huart != drv->huart)
+    return;
+  drv->err_count++;
+  /* 先读 SR 再读 DR，清除 ORE（该操作同时清掉 FE/NE/PE 标志） */
+  __HAL_UART_CLEAR_OREFLAG(huart);
+  huart->ErrorCode = HAL_UART_ERROR_NONE;
+  /* HAL 出错后可能仍置 BUSY_RX 且不使能 DMA 接收，强制回 READY 再重新启动，
+   * 否则 HAL_UART_Receive_DMA 会返回 BUSY、DMA 不被重新打开。 */
+  if (huart->RxState != HAL_UART_STATE_READY)
+  {
+    huart->RxState = HAL_UART_STATE_READY;
+  }
+  (void)HAL_UART_Receive_DMA(huart, drv->rx_buf, drv->rx_size);
+  __HAL_UART_ENABLE_IT(huart, UART_IT_IDLE);
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    UART_Driver_t *drv = s_active;
+    if (drv == NULL || huart != drv->huart)
+        return;
+    /* 推进发送尾指针（已发出的字节数 = tx_sending），若环形缓冲还有数据
+     * 则启动下一帧 HAL_UART_Transmit_IT，否则标记发送结束。 */
+    drv->tx_tail = (uint16_t)(drv->tx_tail + drv->tx_sending) % drv->tx_size;
+    drv->tx_sending = 0U;
+    uint16_t avail = (uint16_t)(drv->tx_head - drv->tx_tail) % drv->tx_size;
+    if (avail > 0U)
     {
-        if (drv->tx_head != drv->tx_tail)
-        {
-            inst->DR = drv->tx_buf[drv->tx_tail];
-            drv->tx_tail = (uint16_t)(drv->tx_tail + 1U) % drv->tx_size;
-            if (drv->tx_head == drv->tx_tail)
-            {
-                /* 缓冲已空，关闭 TXE 中断，标记发送结束 */
-                CLEAR_BIT(inst->CR1, USART_CR1_TXEIE);
-                drv->tx_ongoing = false;
-            }
-        }
-        else
-        {
-            CLEAR_BIT(inst->CR1, USART_CR1_TXEIE);
-            drv->tx_ongoing = false;
-        }
+        uint16_t n = (avail > 64U) ? 64U : avail;
+        /* 不跨环形缓冲末尾发送，避免一次 HAL 调用读到越界内存 */
+        if (n > (uint16_t)(drv->tx_size - drv->tx_tail))
+            n = (uint16_t)(drv->tx_size - drv->tx_tail);
+        drv->tx_sending = n;
+        (void)HAL_UART_Transmit_IT(drv->huart, &drv->tx_buf[drv->tx_tail], n);
+    }
+    else
+    {
+        drv->tx_ongoing = false;
     }
 }
 
@@ -301,6 +334,7 @@ uint16_t UART_GetRxCount(const UART_Driver_t *drv)
     if (drv == NULL)
         return 0U;
     uint32_t pm = uart_enter_critical();
+    uart_sync_rx_head(drv);   /* 同步 DMA 已写入位置 */
     uint16_t c = (uint16_t)(drv->rx_head - drv->rx_tail) % drv->rx_size;
     uart_exit_critical(pm);
     return c;
@@ -311,6 +345,7 @@ void UART_ClearRx(UART_Driver_t *drv)
     if (drv == NULL)
         return;
     uint32_t pm = uart_enter_critical();
+    uart_sync_rx_head(drv);   /* 同步到 DMA 当前位置，丢弃此刻之前的数据 */
     drv->rx_tail = drv->rx_head;
     uart_exit_critical(pm);
 }
@@ -320,6 +355,7 @@ uint16_t UART_ReadRaw(UART_Driver_t *drv, uint8_t *out, uint16_t max_len)
     if (drv == NULL || out == NULL)
         return 0U;
     uint32_t pm = uart_enter_critical();
+    uart_sync_rx_head(drv);   /* 同步 DMA 已写入位置 */
     uint16_t avail = (uint16_t)(drv->rx_head - drv->rx_tail) % drv->rx_size;
     uint16_t n = (avail < max_len) ? avail : max_len;
     for (uint16_t i = 0U; i < n; i++)
@@ -340,6 +376,7 @@ uint16_t UART_ReadFrame(UART_Driver_t *drv, uint8_t *out, uint16_t max_len)
 
     uint16_t fs, ft, po, pl;
     uint32_t pm = uart_enter_critical();
+    uart_sync_rx_head(drv);   /* 同步 DMA 已写入位置，避免漏读刚到达的新字节 */
     if (!uart_locate_frame(drv, &fs, &ft, &po, &pl))
     {
         uart_exit_critical(pm);
@@ -385,11 +422,21 @@ HAL_StatusTypeDef UART_Send(UART_Driver_t *drv, const uint8_t *data, uint16_t le
         drv->tx_buf[drv->tx_head] = data[i];
         drv->tx_head = (uint16_t)(drv->tx_head + 1U) % drv->tx_size;
     }
-    /* 若发送未在进行，启动 TXE 中断(之后由 ISR 自动逐字节发出) */
+    /* 若发送未在进行，启动 HAL 发送中断(之后由 HAL_UART_TxCpltCallback 续发) */
     if (!drv->tx_ongoing)
     {
         drv->tx_ongoing = true;
-        SET_BIT(drv->huart->Instance->CR1, USART_CR1_TXEIE);
+        uint16_t avail = (uint16_t)(drv->tx_head - drv->tx_tail) % drv->tx_size;
+        uint16_t n = (avail > 64U) ? 64U : avail;
+        /* 不跨环形缓冲末尾发送，避免一次 HAL 调用读到越界内存 */
+        if (n > (uint16_t)(drv->tx_size - drv->tx_tail))
+            n = (uint16_t)(drv->tx_size - drv->tx_tail);
+        drv->tx_sending = n;
+        if (HAL_UART_Transmit_IT(drv->huart, &drv->tx_buf[drv->tx_tail], n) != HAL_OK)
+        {
+            drv->tx_ongoing = false;
+            drv->tx_sending = 0U;
+        }
     }
     uart_exit_critical(pm);
     return HAL_OK;

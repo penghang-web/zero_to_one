@@ -251,9 +251,7 @@ void USART1_IRQHandler(void)
   /* USER CODE BEGIN USART1_IRQn 0 */
 
   /* USER CODE END USART1_IRQn 0 */
-  /* 改用稳健 uart_driver 接管 USART1 收发（环形缓冲 + 错误恢复），
-     取代 HAL_UART_IRQHandler（规避单次接收/IDLE 重武装隐患）。 */
-  UART_IRQHandler(&g_uart1);
+  HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */
 
   /* USER CODE END USART1_IRQn 1 */

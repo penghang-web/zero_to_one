@@ -31,7 +31,6 @@
 #include "key.h"
 #include "console.h"
 #include "watchdog.h"   /* 阶段4：WDG_Feed 由 TIM2 节拍 ISR 调用 */
-#include "w25qxx.h"    /* 阶段5：W25Q/GD25 SPI Flash（字库存储），W25QXX_Init/JEDEC */
 #include "ssd1306.h"   /* 阶段5：OLED 驱动 + UI 层（SSD1306_UI_*） */
 #include "mpu6050.h"   /* 阶段6：MPU6050 I2C 驱动（Init/SelfTest/ReadAll/Begin/Process） */
 /* USER CODE END Includes */
@@ -56,6 +55,7 @@
 /* USER CODE BEGIN PV */
 /* 按键相关状态已封装到 key.c（key.h 提供 Key_Init / Key_Process / Key_EXTI_Callback 接口） */
 volatile uint32_t g_systick_ms = 0;   /* TIM2 1ms 节拍计数器，由 HAL_TIM_PeriodElapsedCallback 累加 */
+volatile uint32_t g_main_feed_ms = 0;   /* 主循环活体时间戳：每圈正常跑完即刷新；喂狗门控据此判断是否卡死 */
 /* 注：g_mpu / g_mpu_ok 已下沉到 mpu6050.c（见 mpu6050.h 的 extern 声明），供 UI/控制台使用 */
 /* USER CODE END PV */
 
@@ -104,27 +104,15 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
-  /* MX_IWDG_Init();  调试期临时关闭独立看门狗：IWDG 启动后软件无法关闭，
-   * SWD 擦写时仍在硬件级倒计时，会把编程器连接咬断。关闭后 BOOT0=0 也能
-   * 稳定 SWD 擦写。需要"死机自愈"时再恢复此行（并保留下方 DBGMCU freeze）。 */
+  MX_IWDG_Init();
   MX_I2C1_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
   Console_RxStart();                   /* 启动 USART1 RX（IDLE+DMA 收帧） */
-  W25QXX_Init();                       /* 阶段5：读 W25Q/GD25 JEDEC 并缓存容量 */
-  SSD1306_UI_Init();                   /* 阶段5：初始化 SSD1306 OLED */
+  SSD1306_UI_Init();                   /* 初始化 SSD1306 OLED（英文/ASCII 显示） */
   Console_Printf("\r\n==== MiniBlackBox USART1 Shell ====\r\n");
   Console_Printf("baud 115200 8N1, RX=IDLE+DMA. type 'help'.\r\n");
-  {
-    uint8_t jid[3];
-    W25QXX_JEDEC(jid);
-    Console_Printf("W25Q JEDEC %02X%02X%02X cap=%lu B font=%s\r\n",
-                   jid[0], jid[1], jid[2],
-                   (unsigned long)W25QXX_CapacityBytes(),
-                   W25QXX_FontReady() ? "READY" : "none");
-    Console_Printf("type 'oled' to draw demo, 'flashcn <size>' to burn font.\r\n");
-  }
 
   /* 阶段6：MPU6050 初始化检测（唤醒+识别），失败每 5s 重试由 MPU6050_Process 处理 */
   MPU6050_Begin();
@@ -132,6 +120,7 @@ int main(void)
   /* 阶段3：启动系统节拍与蜂鸣器 PWM（PB1=TIM3_CH4） */
   HAL_TIM_Base_Start_IT(&htim2);                    /* TIM2 1ms 节拍中断 -> 累加 g_systick_ms */
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);         /* 蜂鸣器 PWM 运行，占空比初始 0 = 静音 */
+  g_main_feed_ms = g_systick_ms;   /* 启动时先打一次活体标记，避免上电初期 TIM2 节拍未起时误判卡死 */
 
   /* 阶段4：调试期冻结 IWDG——ST-LINK 暂停在断点时看门狗不计数，
    * 避免"断点被狗咬"误复位。仅调试器连接时生效，正常运行照常喂狗自愈。 */
@@ -154,6 +143,8 @@ int main(void)
     SSD1306_UI_Process();
     /* ---- MPU6050 采样调度：周期读取 + 失连重试（逻辑下沉到 mpu6050.c） ---- */
     MPU6050_Process();
+
+    g_main_feed_ms = g_systick_ms;   /* 主循环活体喂：本圈所有 Process 正常跑完，标记"还活着" */
   }                                        /* while(1) 闭合 */
   /* USER CODE END 3 */
 }
@@ -211,13 +202,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM2)
   {
     g_systick_ms++;
-    /* 阶段4：IWDG 喂狗——每 500ms 喂一次（远小于 1.5s 超时），防误触发。
-     * 放在节拍 ISR 里契合指南"在节拍中断里定期喂狗"；若节拍卡死则狗会复位，正是自愈目的。 */
+    /* 阶段4：IWDG 喂狗——每 500ms 喂一次（远小于 1.5s 超时）。
+     * 关键：用"主循环活体门控"——只有当主循环近期（<1s）仍正常跑完一圈
+     * （g_main_feed_ms 被刷新）才喂狗；否则认为主循环卡死，停止喂狗，
+     * 让 IWDG 在 1.5s 超时后自动复位 MCU，实现"死机自愈"。
+     * 此前把 WDG_Feed 无条件放中断里会导致主循环卡死时中断照常喂狗、看门狗彻底失效。 */
     static uint32_t last_feed_ms = 0;
     if (g_systick_ms - last_feed_ms >= 500U)
     {
       last_feed_ms = g_systick_ms;
-      WDG_Feed();
+      if (g_systick_ms - g_main_feed_ms < 1000U)
+      {
+        WDG_Feed();
+      }
     }
   }
 }
