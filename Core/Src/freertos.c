@@ -32,6 +32,7 @@ extern volatile uint32_t g_main_feed_ms;  /* 系统"活体"时间戳：IWDG 喂�
 #include "ssd1306.h"   /* SSD1306_UI_Process：Phase 3 OLED 显示任务 */
 #include "mpu6050.h"   /* MPU6050_Process：周期性采样 g_mpu，供 OLED 三轴屏显示 */
 #include "key.h"       /* Key_Process：Phase 4 按键任务周期性调用，驱动 PC13 LED/报警 */
+#include "env.h"        /* ENV_Process：Phase 7 环境采集任务，更新 g_env 供 OLED 显示 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -54,6 +55,7 @@ extern volatile uint32_t g_main_feed_ms;  /* 系统"活体"时间戳：IWDG 喂�
 osThreadId consoleTaskHandle;   /* Phase 2：Console 串口任务句柄 */
 osThreadId oledTaskHandle;      /* Phase 3：OLED 显示任务句柄 */
 osThreadId keyTaskHandle;       /* Phase 4：按键任务句柄（驱动 PC13 LED/报警状态机） */
+osThreadId envTaskHandle;        /* Phase 7：环境采集任务句柄（ADC DMA 消费 + g_env 更新） */
 osMutexId  i2c_mutexHandle;     /* I2C 总线互斥锁：串行化 OLED/MPU6050 共享总线访问 */
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
@@ -63,6 +65,7 @@ osThreadId defaultTaskHandle;
 void StartConsoleTask(void const * argument);   /* Phase 2：Console 串口任务入口 */
 void StartOledTask(void const * argument);       /* Phase 3：OLED 显示任务入口 */
 void StartKeyTask(void const * argument);        /* Phase 4：按键任务入口 */
+void StartEnvTask(void const * argument);         /* Phase 7：环境采集任务入口（ENV_Process） */
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void const * argument);
@@ -139,6 +142,13 @@ void MX_FREERTOS_Init(void) {
    * 栈 128 words 足够（状态机 + Buzzer_Process + 几个局部量）；优先级与串口/OLED 同级。 */
   osThreadDef(keyTask, StartKeyTask, osPriorityNormal, 0, 128);
   keyTaskHandle = osThreadCreate(osThread(keyTask), NULL);
+
+  /* Phase 7：环境采集任务 —— 周期性调用 ENV_Process() 消费 DMA 半/全完成标志，
+   * 做温度/光照换算 + 突变检测，更新 g_env（供 OLED 环境屏显示，供阶段8/9 消费）。
+   * ADC 采集本身由 TIM1 触发 + DMA 循环完成，本任务零轮询硬件、只在标志置位时计算。
+   * 栈 192 words 足够（平均循环 + 几个局部量，换算为纯整型无浮点）；优先级与同级。 */
+  osThreadDef(envTask, StartEnvTask, osPriorityNormal, 0, 192);
+  envTaskHandle = osThreadCreate(osThread(envTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -218,6 +228,20 @@ void StartKeyTask(void const * argument)
   for (;;)
   {
     Key_Process();
+    osDelay(10);
+  }
+}
+/* Phase 7：环境采集任务
+ * 周期性调用 ENV_Process()：消费 DMA 半/全完成标志（ISR 置位），对刚稳定的半缓冲求
+ * 两通道平均 → ADC_ToTemp/ADC_ToLight 换算 → Light_SuddenChangeDetect 突变检测 → 写 g_env。
+ * osDelay(10) 让出 CPU（约 100Hz 轮询标志）；DMA 在后台持续搬运，采集零 CPU 占用。
+ * 注：TIM1 触发 + ADC DMA 循环已在 main.c(USER CODE 2) 经 ENV_Init() 武装，此处只做消费。 */
+void StartEnvTask(void const * argument)
+{
+  (void)argument;
+  for (;;)
+  {
+    ENV_Process();
     osDelay(10);
   }
 }

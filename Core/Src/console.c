@@ -15,6 +15,7 @@
 #include "watchdog.h" /* WDG_Feed / WDG_TestHang：看门狗状态查询与复位验证 */
 #include "ssd1306.h"   /* SSD1306_UI_Demo：oled 命令触发 OLED 演示屏 */
 #include "mpu6050.h"  /* 阶段6：MPU6050 原始数据打印 */
+#include "env.h"       /* 阶段7：g_env 温度/光照打印 */
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -33,6 +34,8 @@ static uint8_t s_uart_tx[256];   /* 发送环形缓冲 */
 
 /* mpu 持续打印流：'mpu on' 开启后每 500ms 打印一行原始三轴数据 */
 static uint8_t  s_mpu_stream   = 0;
+/* env 持续打印流：'env on' 开启后每 500ms 打印一行温度/光照（Phase 7） */
+static uint8_t  s_env_stream   = 0;
 
 /* 命令行汇编缓冲（命令模式使用） */
 static char     s_line[LINE_MAX + 1];
@@ -219,6 +222,34 @@ static void Shell_Exec(char *line)
       Console_Printf("usage: mpu | mpu on | mpu off\r\n");
     }
   }
+  else if (strncmp(line, "env", 3) == 0 && (line[3] == ' ' || line[3] == '\0'))
+  {
+    /* env         —— 打印一次当前温度趋势/光照强度/突变标志
+     * env on      —— 持续打印流（每 500ms 一行），便于观察捂热敏/遮光时数据跟随变化
+     * env off     —— 关闭持续打印流 */
+    if (strcmp(line, "env") == 0)
+    {
+      Console_Printf("ENV: temp=%d.%dC light=%d%% sudden=%s raw(t=%u,l=%u)\r\n",
+                     g_env.temp_trend / 10, g_env.temp_trend % 10,
+                     (int)g_env.light_lvl,
+                     g_env.light_sudden ? "YES" : "NO",
+                     g_env.temp_raw, g_env.light_raw);
+    }
+    else if (strcmp(line, "env on") == 0)
+    {
+      s_env_stream = 1;
+      Console_Printf("ENV stream ON (500ms/tick). 'env off' to stop.\r\n");
+    }
+    else if (strcmp(line, "env off") == 0)
+    {
+      s_env_stream = 0;
+      Console_Printf("ENV stream OFF.\r\n");
+    }
+    else
+    {
+      Console_Printf("usage: env | env on | env off\r\n");
+    }
+  }
   /* flashcn 字库烧录功能已移除（不再依赖 W25Q 字库，仅英文/ASCII 显示） */
   else
   {
@@ -236,6 +267,7 @@ void Console_Process(void)
 {
   static uint32_t s_heartbeat_ms = 0;
   static uint32_t s_mpu_print_ms = 0;
+  static uint32_t s_env_print_ms = 0;   /* env 流打印节拍（Phase 7） */
   static uint32_t s_last_rx_ms   = 0;   /* 最近一次收到字节的时间戳，用于空闲自动提交 */
   uint32_t now = g_systick_ms;
 
@@ -268,6 +300,17 @@ void Console_Process(void)
     s_mpu_print_ms = now;
     Console_Printf("MPU ax=%d ay=%d az=%d gx=%d gy=%d gz=%d\r\n",
                    g_mpu.ax, g_mpu.ay, g_mpu.az, g_mpu.gx, g_mpu.gy, g_mpu.gz);
+  }
+
+  /* env 持续打印流：'env on' 开启后每 500ms 打印一次温度/光照（Phase 7）。
+     主循环已持续把采样写进 g_env，这里只负责按节拍输出。 */
+  if (s_env_stream && g_env.ready && now - s_env_print_ms >= 500U)
+  {
+    s_env_print_ms = now;
+    Console_Printf("ENV temp=%d.%dC light=%d%% sudden=%s\r\n",
+                   g_env.temp_trend / 10, g_env.temp_trend % 10,
+                   (int)g_env.light_lvl,
+                   g_env.light_sudden ? "YES" : "NO");
   }
 
   /* ---- 命令模式：把收到的原始字节汇编成行（遇 \n / \r 结束） ---- */

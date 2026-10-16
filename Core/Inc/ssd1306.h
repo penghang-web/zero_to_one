@@ -43,7 +43,8 @@ void SSD1306_DrawString6x8(uint8_t x, uint8_t y, const char *s, uint8_t color);
 void SSD1306_UI_Init(void);      /* 初始化 OLED（内部调 SSD1306_Init + Clear） */
 void SSD1306_UI_Demo(void);      /* 绘制状态屏（英文/ASCII）并立即刷屏 */
 void SSD1306_UI_MPU(void);       /* 绘制 MPU 三轴屏（ACC/GYRO 两页每 2s 切换）并刷屏 */
-void SSD1306_UI_Refresh(void);   /* 仅重刷当前显存（内容由 UI_Demo/UI_MPU 写入） */
+void SSD1306_UI_Env(void);       /* 绘制环境屏（温度趋势/光照强度/突变标志，Phase 7）并刷屏 */
+void SSD1306_UI_Refresh(void);   /* 仅重刷当前显存（内容由 UI_Demo/UI_MPU/UI_Env 写入） */
 void SSD1306_UI_Process(void);   /* 主循环每圈调用：每 4s 切换状态屏/MPU屏，并按节拍重绘 */
 
 #endif /* SSD1306_H */

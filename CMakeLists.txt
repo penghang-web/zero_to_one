@@ -54,6 +54,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/mpu6050.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/i2c.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/soft_i2c.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Src/env.c
 )
 
 # Add include paths

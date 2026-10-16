@@ -11,6 +11,7 @@
 #include "main.h"      /* 引脚/外设句柄所在 */
 #include "i2c.h"       /* hi2c1 (extern) */
 #include "mpu6050.h"   /* g_mpu / g_mpu_ok：MPU 三轴屏数据显示 */
+#include "env.h"       /* g_env：Phase 7 温度/光照屏数据显示 */
 #include "font8x16.h"  /* 内置 ASCII 8x16 字模 */
 #include "font6x8.h"    /* 内置 ASCII 6x8 小字模（密集信息显示） */
 #include "stm32f1xx_hal.h"
@@ -280,27 +281,53 @@ void SSD1306_UI_MPU(void)
   SSD1306_Refresh();
 }
 
-/* 主循环每圈调用：状态屏(SSD1306_UI_Demo) 与 MPU 屏(SSD1306_UI_MPU) 每 4s 交替；
- * MPU 屏数据变化快，每 500ms 重绘；状态屏每 1s 重绘即可（原 main.c 调度逻辑下沉）。 */
+/* -------------------------------------------------------------------------- */
+/* 环境屏：温度趋势 / 光照强度 / 突变标志（Phase 7 新增，读取 g_env）            */
+/* 同样遵循"字符高度固定 16px、3 行、行间距 3px、底部 10px 留白"规格。          */
+void SSD1306_UI_Env(void)
+{
+  SSD1306_Clear();
+  char line[24];
+
+  /* 行0（Y=0）：温度趋势（单位 0.1°C，阶段7未绝对标定） */
+  snprintf(line, sizeof(line), "TEMP %+5d", (int)g_env.temp_trend);
+  SSD1306_DrawString(0, UI_LINE0_Y, line, 1);
+
+  /* 行1（Y=19）：光照强度（0..100 百分比） */
+  snprintf(line, sizeof(line), "LIGHT %3d", (int)g_env.light_lvl);
+  SSD1306_DrawString(0, UI_LINE1_Y, line, 1);
+
+  /* 行2（Y=38）：光照突变标志 + 就绪状态 */
+  snprintf(line, sizeof(line), "SUD:%s", g_env.light_sudden ? "YES" : "NO");
+  SSD1306_DrawString(0, UI_LINE2_Y, line, 1);
+
+  SSD1306_Refresh();
+}
+
+/* 主循环每圈调用：状态屏(SSD1306_UI_Demo) / MPU 屏(SSD1306_UI_MPU) /
+ * 环境屏(SSD1306_UI_Env) 三屏每 4s 循环；MPU 屏数据变化快，每 500ms 重绘，
+ * 其余每 1s 重绘即可（原 main.c 调度逻辑下沉）。 */
 void SSD1306_UI_Process(void)
 {
   static uint32_t s_oled_ms = 0;    /* 屏幕切换节拍 */
   static uint32_t s_oled_draw = 0;  /* 当前屏重绘节拍 */
-  static uint8_t  s_oled_mode = 0;  /* 0=状态屏, 1=MPU屏 */
+  static uint8_t  s_oled_mode = 0;  /* 0=状态屏, 1=MPU屏, 2=环境屏 */
 
   if (g_systick_ms - s_oled_ms >= 4000U)
   {
     s_oled_ms = g_systick_ms;
-    s_oled_mode ^= 1U;
+    s_oled_mode = (uint8_t)((s_oled_mode + 1U) % 3U);
   }
-  /* MPU 屏数据变化快，每 500ms 重绘；状态屏每 1s 重绘即可 */
+  /* MPU 屏数据变化快，每 500ms 重绘；状态屏/环境屏每 1s 重绘即可 */
   uint32_t period = (s_oled_mode == 1U) ? 500U : 1000U;
   if (g_systick_ms - s_oled_draw >= period)
   {
     s_oled_draw = g_systick_ms;
-    if (s_oled_mode == 1U)
+    if (s_oled_mode == 0U)
+      SSD1306_UI_Demo();
+    else if (s_oled_mode == 1U)
       SSD1306_UI_MPU();
     else
-      SSD1306_UI_Demo();
+      SSD1306_UI_Env();
   }
 }

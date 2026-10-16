@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "adc.h"
 #include "dma.h"
 #include "iwdg.h"
 #include "spi.h"
@@ -34,6 +35,7 @@
 #include "ssd1306.h"   /* 阶段5：OLED 驱动 + UI 层（SSD1306_UI_*） */
 #include "mpu6050.h"   /* 阶段6：MPU6050 I2C 驱动（Init/SelfTest/ReadAll/Begin/Process） */
 #include "soft_i2c.h"  /* 阶段3：软件 I2C 驱动（替代硬件 I2C，消除 BUSY 锁死） */
+#include "env.h"       /* 阶段7：温度/光照采集（ENV_Init / ENV_Process / g_env） */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -108,6 +110,8 @@ int main(void)
   MX_TIM3_Init();
   MX_IWDG_Init();
   MX_SPI1_Init();
+  MX_ADC1_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   Key_Init();                          /* 初始化按键模块（状态机/报警标志清零） */
   Console_RxStart();                   /* 启动 USART1 RX（IDLE+DMA 收帧） */
@@ -118,6 +122,11 @@ int main(void)
 
   /* 阶段6：MPU6050 初始化检测（唤醒+识别），失败每 5s 重试由 MPU6050_Process 处理 */
   MPU6050_Begin();
+
+  /* 阶段7：启动 TIM1 触发 + ADC1 DMA 循环采集（温度/光照）。
+   * 须在 MX_ADC1_Init / MX_TIM1_Init（CubeMX 生成，见上方 USER CODE 2 之前的初始化块）
+   * 之后调用。DMA 循环在后台持续搬运，envTask 负责消费。 */
+  ENV_Init();
 
   /* 阶段3：启动系统节拍与蜂鸣器 PWM（PB1=TIM3_CH4） */
   HAL_TIM_Base_Start_IT(&htim2);                    /* TIM2 1ms 节拍中断 -> 累加 g_systick_ms */
@@ -165,6 +174,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -192,6 +202,12 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
