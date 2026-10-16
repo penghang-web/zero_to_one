@@ -70,7 +70,10 @@ void Console_Tx(const uint8_t *buf, uint16_t len)
 /* printf 风格日志：格式化进局部缓冲再发送（字符串保持 ASCII，中文走注释） */
 void Console_Printf(const char *fmt, ...)
 {
-  static char tbuf[LINE_MAX];
+  /* 改为栈上局部变量：本函数被 consoleTask 与 oledTask 两处调用，
+   * 若用 static 缓冲，两任务并发时会互相覆盖 tbuf 导致日志错乱（P2 并发缺陷）。
+   * 384 字任务栈放得下这 160 字节局部缓冲。 */
+  char tbuf[LINE_MAX];
   va_list ap;
 
   va_start(ap, fmt);

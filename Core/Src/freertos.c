@@ -31,6 +31,7 @@ extern volatile uint32_t g_main_feed_ms;  /* 系统"活体"时间戳：IWDG 喂�
 #include "console.h"   /* Console_Process：Phase 2 串口任务周期性调用的命令行处理 */
 #include "ssd1306.h"   /* SSD1306_UI_Process：Phase 3 OLED 显示任务 */
 #include "mpu6050.h"   /* MPU6050_Process：周期性采样 g_mpu，供 OLED 三轴屏显示 */
+#include "key.h"       /* Key_Process：Phase 4 按键任务周期性调用，驱动 PC13 LED/报警 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +53,7 @@ extern volatile uint32_t g_main_feed_ms;  /* 系统"活体"时间戳：IWDG 喂�
 /* USER CODE BEGIN Variables */
 osThreadId consoleTaskHandle;   /* Phase 2：Console 串口任务句柄 */
 osThreadId oledTaskHandle;      /* Phase 3：OLED 显示任务句柄 */
+osThreadId keyTaskHandle;       /* Phase 4：按键任务句柄（驱动 PC13 LED/报警状态机） */
 osMutexId  i2c_mutexHandle;     /* I2C 总线互斥锁：串行化 OLED/MPU6050 共享总线访问 */
 /* USER CODE END Variables */
 osThreadId defaultTaskHandle;
@@ -60,6 +62,7 @@ osThreadId defaultTaskHandle;
 /* USER CODE BEGIN FunctionPrototypes */
 void StartConsoleTask(void const * argument);   /* Phase 2：Console 串口任务入口 */
 void StartOledTask(void const * argument);       /* Phase 3：OLED 显示任务入口 */
+void StartKeyTask(void const * argument);        /* Phase 4：按键任务入口 */
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void const * argument);
@@ -129,6 +132,13 @@ void MX_FREERTOS_Init(void) {
    * 与后续 MPU6050 任务不抢总线。栈 384 words 与 Console 任务同级。 */
   osThreadDef(oledTask, StartOledTask, osPriorityNormal, 0, 384);
   oledTaskHandle = osThreadCreate(osThread(oledTask), NULL);
+
+  /* Phase 4：按键任务 —— 周期性调用 Key_Process() 推进按键状态机并驱动 PC13 LED。
+   * EXTI9_5 中断（PB5 按键）仅置 s_key_irq 边沿标志（ISR 不调任何 RTOS API），
+   * 本任务以约 100Hz 轮询消费，平移"裸机轮询"为"任务轮询"，最简最稳。
+   * 栈 128 words 足够（状态机 + Buzzer_Process + 几个局部量）；优先级与串口/OLED 同级。 */
+  osThreadDef(keyTask, StartKeyTask, osPriorityNormal, 0, 128);
+  keyTaskHandle = osThreadCreate(osThread(keyTask), NULL);
   /* USER CODE END RTOS_THREADS */
 
 }
@@ -143,13 +153,14 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void const * argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-  /* Phase 1 心跳任务：唯一目的是证明"FreeRTOS 内核已在调度"。
-   * - PC13(LED) 每 500ms 翻转一次：肉眼可见的调度证据。
-   * - 每圈刷新 g_main_feed_ms：TIM2 ISR 里的喂狗门控据此放行
-   *   （任务活着 -> 喂狗；任务卡死 -> 停止喂狗 -> IWDG 1.5s 超时复位）。 */
+  /* Phase 1 心跳任务（Phase 4 起职责收窄）：
+   * 唯一保留职责 —— 每 500ms 刷新 g_main_feed_ms，供 TIM2 ISR 里的喂狗门控放行
+   * （任务活着 -> 喂狗；任务卡死 -> 停止喂狗 -> IWDG 1.5s 超时复位）。
+   * ⚠ 喂狗门控这一行必须保留，否则 IWDG 会超时复位！
+   * PC13(LED) 的心跳翻转已自 Phase 4 起移交给 keyTask（Key_Process 驱动），
+   * 此处不再触碰 PC13，避免与按键模块的 LED 逻辑争抢同一引脚。 */
   for(;;)
   {
-    HAL_GPIO_TogglePin(LED_PC13_GPIO_Port, LED_PC13_Pin);
     g_main_feed_ms = g_systick_ms;
     osDelay(500);
   }
@@ -191,6 +202,22 @@ void StartOledTask(void const * argument)
   {
     MPU6050_Process();    /* 采样 g_mpu（缺省每 100ms 一次），先于显示使其最新 */
     SSD1306_UI_Process();
+    osDelay(10);
+  }
+}
+/* Phase 4：按键任务
+ * 周期性调用 Key_Process()：消费 EXTI9_5 边沿标志、推进按键状态机、驱动 PC13 LED
+ * （正常态 1Hz 闪烁 = 系统存活证据；报警态常亮 = 蜂鸣器+LED 报警）。
+ * 自 Phase 4 起，PC13 的归属从 defaultTask 移交给本任务，消除两模块争抢同一引脚
+ * （此前 defaultTask 500ms 翻转 PC13，与 Key_Process 的 LED 逻辑冲突，导致 led on/off
+ * 命令行为错乱）。defaultTask 只保留喂狗门控（g_main_feed_ms 刷新），不再碰 PC13。
+ * osDelay(10) 让出 CPU（约 100Hz 轮询），交互延迟 <10ms 足够。 */
+void StartKeyTask(void const * argument)
+{
+  (void)argument;
+  for (;;)
+  {
+    Key_Process();
     osDelay(10);
   }
 }

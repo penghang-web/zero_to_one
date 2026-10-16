@@ -35,21 +35,26 @@ void MX_IWDG_Init(void)
   /* USER CODE END IWDG_Init 0 */
 
   /* USER CODE BEGIN IWDG_Init 1 */
-  /* CubeMX 图形界面里 Counter Reload Value 仍停在默认 4095（约 26s 超时），这里在
-   * Init 前覆盖为 234，使 IWDG 超时约 1.5s（LSI 40kHz / 256 × 234 × 6.4ms），
-   * 对齐《从0到1搭建指南》阶段4"配置溢出窗口（如 ~1.5s）"。
-   * 若后续在 CubeMX 把该值改为 234 并重新生成，此覆盖行即冗余可删。 */
-  hiwdg.Init.Reload = 234;
+  /* 注：原先在此处写 `hiwdg.Init.Reload = 234;` 是无效的——它位于下方生成行
+   * `hiwdg.Init.Reload = 4095;` 之前，会被后者覆盖。真正的覆盖已改到本函数末尾
+   * 的 USER CODE IWDG_Init 2 块内，在 HAL_IWDG_Init() 之后直接写硬件寄存器实现。 */
   /* USER CODE END IWDG_Init 1 */
   hiwdg.Instance = IWDG;
   hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
-  hiwdg.Init.Reload = 4095;
+  hiwdg.Init.Reload = 234;
   if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN IWDG_Init 2 */
-
+  /* CubeMX 图形界面里 "IWDG down-counter reload value" 字段被锁定（齿轮图标）无法在 GUI
+   * 把 4095 改成 234。因此改在这里——HAL_IWDG_Init() 之后直接写硬件寄存器，把看门狗超时
+   * 从 ~26s 缩短到 ~1.5s（LSI 40kHz，预分频 256 → 6.4ms/格，234×6.4ms ≈ 1.5s）。
+   * 全程不触碰 CubeMX 生成区。若日后 CubeMX 该字段解锁并设为 234，本段即可整段删除。 */
+  IWDG->KR  = 0x00005555U;        /* 解开 IWDG_PR / IWDG_RLR 写保护 */
+  IWDG->RLR = 234U;               /* 重装载值 = 234（约 1.5s） */
+  while (IWDG->SR != 0U) { }      /* 等待 RLR/PR 更新同步完成（RVU/PVU 清零） */
+  IWDG->KR  = 0x0000AAAAU;        /* 立即喂一次狗，按新值重新计数 */
   /* USER CODE END IWDG_Init 2 */
 
 }

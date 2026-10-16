@@ -147,12 +147,12 @@ int main(void)
     /* ==== Phase 1（FreeRTOS 迁移）：本块已不可达 ====
      * osKernelStart() 之后控制权交给调度器，永不回到这个 while(1)。
      * 原先四个 Process 调用已下线，功能按分期迁到各自任务：
-     *   Key_Process()        -> Phase 4 按键任务
+     *   Key_Process()        -> 已并入 Phase 4 按键任务（keyTask 循环调用）
      *   Console_Process()    -> Phase 2 串口任务
      *   SSD1306_UI_Process() -> Phase 3 显示任务
-     *   MPU6050_Process()    -> 并入 Phase 3 OLED 任务循环（FreeRTOS 堆仅 4096B，
-     *                          不另开 MPU 任务以免堆溢出；两者同走 i2c_mutex 串行化）
-     * 活体喂狗（g_main_feed_ms）改由默认任务里的心跳每 500ms 刷新。 */
+     *   MPU6050_Process()    -> 并入 Phase 3 OLED 任务循环（FreeRTOS 堆 8KB 已扩，
+     *                          但并入 OLED 任务最省资源；两者同走 i2c_mutex 串行化）
+     * 活体喂狗（g_main_feed_ms）改由默认任务每 500ms 刷新（PC13 心跳已移交 keyTask）。 */
   }                                        /* while(1) 闭合 */
   /* USER CODE END 3 */
 }
